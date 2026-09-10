@@ -7,6 +7,8 @@ INCLUDEPATH += src
 
 SOURCES += src/main.cpp \
            src/App1Codec.cpp \
+           src/FirmwareInfo.cpp \
+           src/DeviceInfo.cpp \
            src/IntelHexParser.cpp \
            src/UpgradeTransport.cpp \
            src/FirmwareUpgradeController.cpp \
@@ -15,6 +17,8 @@ SOURCES += src/main.cpp \
            src/FirmwareUpgradeDialog.cpp
 
 HEADERS += src/App1Codec.h \
+           src/FirmwareInfo.h \
+           src/DeviceInfo.h \
            src/IntelHexParser.h \
            src/UpgradeTransport.h \
            src/FirmwareUpgradeController.h \

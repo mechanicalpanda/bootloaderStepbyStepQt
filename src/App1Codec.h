@@ -20,6 +20,8 @@ public:
     {
         EnterBootloader = 0x0001,
         GetMode = 0x0002,
+        GetDeviceInfo = 0x0003,
+        GetFirmwareInfo = 0x0004,
         BlHello = 0x0200,
         BlBegin = 0x0201,
         BlData = 0x0202,
@@ -39,13 +41,14 @@ public:
     {
         CanEnterBootloader = 0x00000001U,
         CanUpgrade = 0x00000002U,
-        CanReboot = 0x00000004U
+        CanReboot = 0x00000004U,
+        CanQueryDeviceInfo = 0x00000008U,
+        CanQueryFirmwareInfo = 0x00000010U
     };
 
     static constexpr quint16 ModeProtocolVersion = 0x0001U;
-
     static constexpr int HeaderSize = 24;
-    static constexpr int MaxPayloadSize = 256;
+    static constexpr int MaxPayloadSize = 320;
     static constexpr quint16 ResponseFlag = 0x0001;
     static constexpr quint16 ErrorFlag = 0x0002;
 
