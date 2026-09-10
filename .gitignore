@@ -1,0 +1,9 @@
+# Qt Creator per-user settings
+*.pro.user
+*.pro.user.*
+
+# Out-of-source build directories
+build-*/
+
+# Packaged Windows binaries and Qt runtime dependencies
+deploy/
