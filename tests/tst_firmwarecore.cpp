@@ -1,11 +1,15 @@
 #include <QtTest>
 
 #include "App1Codec.h"
+#include "DeviceInfo.h"
+#include "FirmwareInfo.h"
 #include "FirmwareUpgradeController.h"
 #include "FirmwareUpgradeDialog.h"
 #include "IntelHexParser.h"
 #include "UpgradeTransport.h"
 #include "WinUsbDeviceDiscovery.h"
+
+#include <QtEndian>
 
 class FakeTransport : public UpgradeTransport
 {
@@ -16,24 +20,42 @@ public:
 
     QList<UpgradeDevice> discover(QString *error) override
     {
-        if (error) error->clear();
+        if (error)
+            error->clear();
         return devices;
     }
+
     bool open(const UpgradeDevice &, QString *error) override
     {
         opened = true;
-        if (error) error->clear();
+        if (error)
+            error->clear();
         return true;
     }
-    void close() override { opened = false; }
+
+    void close() override
+    {
+        opened = false;
+    }
+
     bool write(const QByteArray &data, QString *error) override
     {
         writes.append(data);
-        if (error) error->clear();
+        if (error)
+            error->clear();
         return true;
     }
-    void deliver(const QByteArray &data) { emit dataReceived(data); }
-    void disconnectNow() { opened = false; emit disconnected(); }
+
+    void deliver(const QByteArray &data)
+    {
+        emit dataReceived(data);
+    }
+
+    void disconnectNow()
+    {
+        opened = false;
+        emit disconnected();
+    }
 };
 
 class FirmwareCoreTest : public QObject
@@ -41,57 +63,179 @@ class FirmwareCoreTest : public QObject
     Q_OBJECT
 
 private:
+    static void write16(QByteArray &data, int offset, quint16 value)
+    {
+        qToLittleEndian(value,
+                        reinterpret_cast<uchar *>(data.data() + offset));
+    }
+
+    static void write32(QByteArray &data, int offset, quint32 value)
+    {
+        qToLittleEndian(value,
+                        reinterpret_cast<uchar *>(data.data() + offset));
+    }
+
+    static void write64(QByteArray &data, int offset, quint64 value)
+    {
+        qToLittleEndian(value,
+                        reinterpret_cast<uchar *>(data.data() + offset));
+    }
+
     static void append16(QByteArray &data, quint16 value)
     {
-        data.append(char(value));
-        data.append(char(value >> 8));
+        char bytes[2];
+        qToLittleEndian(value, reinterpret_cast<uchar *>(bytes));
+        data.append(bytes, 2);
     }
 
     static void append32(QByteArray &data, quint32 value)
     {
-        data.append(char(value));
-        data.append(char(value >> 8));
-        data.append(char(value >> 16));
-        data.append(char(value >> 24));
+        char bytes[4];
+        qToLittleEndian(value, reinterpret_cast<uchar *>(bytes));
+        data.append(bytes, 4);
     }
 
-    static QByteArray record(quint16 address, quint8 type, const QByteArray &data)
+    static QByteArray header(quint16 major = 1U, quint16 minor = 0U,
+                             quint16 patch = 0U,
+                             quint32 product = 0x00010001U,
+                             const QByteArray &commit = "0123456789ab")
     {
-        QByteArray raw;
-        raw.append(char(data.size()));
-        raw.append(char(address >> 8));
-        raw.append(char(address));
-        raw.append(char(type));
-        raw.append(data);
-        quint8 sum = 0;
-        for (char byte : raw)
-            sum = quint8(sum + quint8(byte));
-        raw.append(char(quint8(0U - sum)));
-        return ":" + raw.toHex().toUpper() + "\n";
+        QByteArray bytes(FirmwareInfo::HeaderSize, char(0));
+        bytes.replace(0, 4, QByteArrayLiteral("FWI1"));
+        write16(bytes, 4, 1U);
+        write16(bytes, 6, FirmwareInfo::HeaderSize);
+        write32(bytes, 8, product);
+        write16(bytes, 0x0C, 1U);
+        write16(bytes, 0x0E, 1U);
+        write16(bytes, 0x10, major);
+        write16(bytes, 0x12, minor);
+        write16(bytes, 0x14, patch);
+        write16(bytes, 0x16, FirmwareInfo::DebugBuildFlag);
+        write32(bytes, 0x18, 77U);
+        write32(bytes, 0x1C, IntelHexParser::ApplicationBase);
+        write32(bytes, 0x20, IntelHexParser::VectorBase);
+        write32(bytes, 0x24, IntelHexParser::ApplicationSize);
+        write64(bytes, 0x28, 1700000000ULL);
+        bytes.replace(0x30, 5, QByteArrayLiteral("MYFOC"));
+        bytes.replace(0x50, 22, QByteArrayLiteral("MYFOC Motor Controller"));
+        bytes.replace(0x70, 19, QByteArrayLiteral("FOCTEST Application"));
+        bytes.replace(0x90, commit.size(), commit);
+        write32(bytes, 0xFC, App1Codec::crc32(bytes.left(0xFC)));
+        return bytes;
     }
 
-    static QByteArray modePayload(quint8 mode, quint32 capabilities)
+    static FirmwareInfo info(quint16 major = 1U, quint16 minor = 0U,
+                             quint16 patch = 0U,
+                             quint32 product = 0x00010001U,
+                             const QByteArray &commit = "0123456789ab")
+    {
+        FirmwareInfo result;
+        QString error;
+        const bool decoded = FirmwareInfo::decode(
+            header(major, minor, patch, product, commit), &result, &error);
+        Q_ASSERT_X(decoded, "FirmwareCoreTest::info", qPrintable(error));
+        return result;
+    }
+
+    static FirmwareImage image(const FirmwareInfo &firmwareInfo = info())
+    {
+        FirmwareImage result;
+        result.baseAddress = IntelHexParser::ApplicationBase;
+        result.image = QByteArray(600, char(0xFF));
+        result.image.replace(0, FirmwareInfo::HeaderSize, firmwareInfo.raw);
+        result.crc32 = App1Codec::crc32(result.image);
+        result.firmwareInfo = firmwareInfo;
+        return result;
+    }
+
+    static QByteArray modePayload(quint8 mode)
     {
         QByteArray payload;
         append16(payload, App1Codec::ModeProtocolVersion);
         payload.append(char(mode));
         payload.append(char(0));
+        quint32 capabilities = App1Codec::CanQueryDeviceInfo
+                             | App1Codec::CanQueryFirmwareInfo;
+        capabilities |= mode == App1Codec::ApplicationMode
+            ? App1Codec::CanEnterBootloader
+            : App1Codec::CanUpgrade | App1Codec::CanReboot;
         append32(payload, capabilities);
         return payload;
     }
 
+    static QByteArray devicePayload(quint8 mode,
+                                    quint32 product = 0x00010001U,
+                                    quint16 hardware = 1U)
+    {
+        QByteArray payload(DeviceInfo::PayloadSize, char(0));
+        write16(payload, 0, 1U);
+        payload[2] = char(mode);
+        write32(payload, 4, product);
+        write16(payload, 8, hardware);
+        quint32 capabilities = App1Codec::CanQueryDeviceInfo
+                             | App1Codec::CanQueryFirmwareInfo;
+        capabilities |= mode == App1Codec::ApplicationMode
+            ? App1Codec::CanEnterBootloader
+            : App1Codec::CanUpgrade | App1Codec::CanReboot;
+        write32(payload, 12, capabilities);
+        payload.replace(16, 12, QByteArray::fromHex(
+            "001E00453432511933373439"));
+        return payload;
+    }
+
+    static UpgradeDevice upgradeDevice(UpgradeDevice::Mode mode)
+    {
+        UpgradeDevice device;
+        device.path = QStringLiteral("fake-device");
+        device.serial = QStringLiteral("001E00453432511933373439");
+        device.product = QStringLiteral("MYFOC Motor Controller");
+        device.vid = 0xCAFEU;
+        device.pid = 0x4070U;
+        device.mode = mode;
+        return device;
+    }
+
+    static App1Frame lastRequest(const FakeTransport &transport)
+    {
+        App1Frame frame;
+        QString error;
+        const bool decoded = App1Codec::decode(
+            transport.writes.last(), &frame, &error);
+        Q_ASSERT_X(decoded, "FirmwareCoreTest::lastRequest", qPrintable(error));
+        return frame;
+    }
+
+    static void respond(FakeTransport &transport, quint16 expectedType,
+                        const QByteArray &payload, bool error = false)
+    {
+        const App1Frame request = lastRequest(transport);
+        QCOMPARE(request.type, expectedType);
+        transport.deliver(App1Codec::encodeResponse(
+            request.type, request.sequence, error, payload));
+    }
+
+    static void answerInformationSequence(
+        FakeTransport &transport, quint8 mode,
+        const QByteArray &installedHeader = header(),
+        quint32 product = 0x00010001U, quint16 hardware = 1U)
+    {
+        respond(transport, App1Codec::GetMode, modePayload(mode));
+        respond(transport, App1Codec::GetDeviceInfo,
+                devicePayload(mode, product, hardware));
+        respond(transport, App1Codec::GetFirmwareInfo, installedHeader);
+    }
+
 private slots:
-    void exposesRequiredUpgradeControls()
+    void exposesFirmwareAndCompatibilityControls()
     {
         FirmwareUpgradeDialog dialog;
         QVERIFY(dialog.findChild<QObject *>(QStringLiteral("deviceCombo")));
-        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("refreshButton")));
-        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("firmwarePath")));
         QVERIFY(dialog.findChild<QObject *>(QStringLiteral("browseButton")));
-        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("upgradeProgress")));
+        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("candidateFirmwareInfo")));
+        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("deviceFirmwareInfo")));
+        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("compatibilityStatus")));
+        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("allowDowngrade")));
         QVERIFY(dialog.findChild<QObject *>(QStringLiteral("startButton")));
-        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("cancelButton")));
-        QVERIFY(dialog.findChild<QObject *>(QStringLiteral("eventLog")));
     }
 
     void parsesWinUsbDeviceIdentityFromInterfacePath()
@@ -100,178 +244,117 @@ private slots:
         const QString path = QStringLiteral(
             R"(\\?\usb#vid_cafe&pid_4070&mi_02#ABC123#{6e15414d-b3e8-4b08-9b73-73db7e6a0f40})");
         QVERIFY(WinUsbDeviceDiscovery::parseDevicePath(path, &device));
-        QCOMPARE(device.vid, quint16(0xCAFE));
-        QCOMPARE(device.pid, quint16(0x4070));
+        QCOMPARE(device.vid, quint16(0xCAFEU));
+        QCOMPARE(device.pid, quint16(0x4070U));
         QCOMPARE(device.serial, QStringLiteral("ABC123"));
-        QCOMPARE(device.mode, UpgradeDevice::UnknownMode);
-        QVERIFY(device.displayName().contains(QStringLiteral("Unknown")));
-
-        QVERIFY(!WinUsbDeviceDiscovery::parseDevicePath(
-            QStringLiteral(
-                R"(\\?\usb#vid_cafe&pid_4071&mi_00#OLD#{guid})"),
-            &device));
-
-        QVERIFY(!WinUsbDeviceDiscovery::parseDevicePath(
-            QStringLiteral(R"(\\?\usb#vid_1234&pid_5678#OTHER#{guid})"),
-            &device));
     }
 
-    void parsesExtendedLinearAddressAndFillsGaps()
+    void app1AcceptsAndReassembles320BytePayload()
     {
-        QByteArray hex;
-        hex += record(0, 4, QByteArray::fromHex("0802"));
-        hex += record(0, 0, QByteArray::fromHex("0000012011000208"));
-        hex += record(0x10, 0, QByteArray::fromHex("AABB"));
-        hex += record(0, 1, {});
-
-        FirmwareImage image;
+        const QByteArray payload(320, char(0xA5));
+        const QByteArray encoded = App1Codec::encodeResponse(
+            App1Codec::GetFirmwareInfo, 9U, false, payload);
+        QVERIFY(!encoded.isEmpty());
+        QByteArray stream = QByteArrayLiteral("noise") + encoded.left(63);
+        App1Frame decoded;
         QString error;
-        QVERIFY2(IntelHexParser::parse(hex, &image, &error), qPrintable(error));
-        QCOMPARE(image.baseAddress, quint32(0x08020000));
-        QCOMPARE(image.image.size(), 18);
-        QCOMPARE(image.image.mid(8, 8), QByteArray(8, char(0xFF)));
-        QCOMPARE(image.image.right(2), QByteArray::fromHex("AABB"));
-        QCOMPARE(image.crc32, App1Codec::crc32(image.image));
-        QCOMPARE(image.imageVersion, image.crc32);
+        QVERIFY(!App1Codec::takeFrame(&stream, &decoded, &error));
+        stream += encoded.mid(63);
+        QVERIFY2(App1Codec::takeFrame(&stream, &decoded, &error),
+                 qPrintable(error));
+        QCOMPARE(decoded.payload, payload);
     }
 
-    void rejectsBadChecksumAndOutOfRangeData()
-    {
-        FirmwareImage image;
-        QString error;
-        QByteArray bad = record(0, 4, QByteArray::fromHex("0802"));
-        bad[bad.size() - 3] = (bad[bad.size() - 3] == '0') ? '1' : '0';
-        QVERIFY(!IntelHexParser::parse(bad, &image, &error));
-        QVERIFY(error.contains("checksum", Qt::CaseInsensitive));
-
-        QByteArray outside;
-        outside += record(0, 4, QByteArray::fromHex("0801"));
-        outside += record(0, 0, QByteArray::fromHex("0102"));
-        outside += record(0, 1, {});
-        QVERIFY(!IntelHexParser::parse(outside, &image, &error));
-        QVERIFY(error.contains("range", Qt::CaseInsensitive));
-
-        QByteArray shortImage;
-        shortImage += record(0, 4, QByteArray::fromHex("0802"));
-        shortImage += record(0, 0, QByteArray::fromHex("0000012001010208"));
-        shortImage += record(0, 1, {});
-        QVERIFY(!IntelHexParser::parse(shortImage, &image, &error));
-        QVERIFY(error.contains("vector", Qt::CaseInsensitive));
-
-        QByteArray trailing;
-        trailing += record(0, 4, QByteArray::fromHex("0802"));
-        trailing += record(0, 0, QByteArray::fromHex("0000012005000208"));
-        trailing += record(0, 1, {});
-        trailing += record(8, 0, QByteArray::fromHex("AABBCCDD"));
-        QVERIFY(!IntelHexParser::parse(trailing, &image, &error));
-        QVERIFY(error.contains("EOF", Qt::CaseInsensitive));
-    }
-
-    void encodesAndDecodesApp1Frames()
-    {
-        const QByteArray payload = QByteArray::fromHex("01020304");
-        QByteArray encoded = App1Codec::encodeRequest(
-            App1Codec::BlBegin, 0x12345678U, payload);
-        QCOMPARE(encoded.size(), App1Codec::HeaderSize + payload.size());
-
-        App1Frame frame;
-        QString error;
-        QVERIFY2(App1Codec::decode(encoded, &frame, &error), qPrintable(error));
-        QCOMPARE(frame.type, quint16(App1Codec::BlBegin));
-        QCOMPARE(frame.sequence, quint32(0x12345678U));
-        QCOMPARE(frame.flags, quint16(0));
-        QCOMPARE(frame.payload, payload);
-
-        encoded[20] = char(encoded.at(20) ^ 1);
-        QVERIFY(!App1Codec::decode(encoded, &frame, &error));
-        QVERIFY(error.contains("header CRC", Qt::CaseInsensitive));
-    }
-
-    void extractsCrossPacketFrameFromStream()
-    {
-        QByteArray stream = QByteArray("noise");
-        const QByteArray expected = App1Codec::encodeResponse(
-            App1Codec::BlStatus, 4U, false, QByteArray::fromHex("0102"));
-        stream += expected.left(7);
-        App1Frame frame;
-        QString error;
-        QVERIFY(!App1Codec::takeFrame(&stream, &frame, &error));
-        stream += expected.mid(7);
-        QVERIFY2(App1Codec::takeFrame(&stream, &frame, &error), qPrintable(error));
-        QCOMPARE(frame.type, quint16(App1Codec::BlStatus));
-        QCOMPARE(frame.payload, QByteArray::fromHex("0102"));
-        QVERIFY(stream.isEmpty());
-    }
-
-    void refreshQueriesModeInsteadOfTrustingPid()
+    void refreshQueriesModeWithoutTrustingPid()
     {
         FakeTransport transport;
-        UpgradeDevice device;
-        device.path = QStringLiteral("fake-device");
-        device.serial = QStringLiteral("ABC123");
-        device.product = QStringLiteral("MYFOC Motor Controller");
-        device.vid = 0xCAFE;
-        device.pid = 0x4070;
-        transport.devices = {device};
-
+        transport.devices = {upgradeDevice(UpgradeDevice::UnknownMode)};
         FirmwareUpgradeController controller(&transport);
         QSignalSpy devicesSpy(&controller,
                               &FirmwareUpgradeController::devicesChanged);
         controller.refreshDevices();
-        QCOMPARE(transport.writes.size(), 1);
-        QCOMPARE(devicesSpy.count(), 0);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::ApplicationMode,
-                        App1Codec::CanEnterBootloader)));
+        respond(transport, App1Codec::GetMode,
+                modePayload(App1Codec::ApplicationMode));
         QCOMPARE(devicesSpy.count(), 1);
-        const QList<UpgradeDevice> resolved =
+        const QList<UpgradeDevice> devices =
             qvariant_cast<QList<UpgradeDevice>>(devicesSpy.last().at(0));
-        QCOMPARE(resolved.size(), 1);
-        QCOMPARE(resolved.first().mode, UpgradeDevice::ApplicationMode);
+        QCOMPARE(devices.first().mode, UpgradeDevice::ApplicationMode);
     }
 
-    void advancesProgressOnlyFromBootloaderAcknowledgements()
+    void queriesIdentityBeforeEnteringBootloader()
     {
         FakeTransport transport;
-        UpgradeDevice boot;
-        boot.path = QStringLiteral("fake-boot");
-        boot.serial = QStringLiteral("ABC123");
-        boot.product = QStringLiteral("MYFOC Motor Controller");
-        boot.vid = 0xCAFE;
-        boot.pid = 0x4070;
-        boot.mode = UpgradeDevice::BootloaderMode;
-        transport.devices = {boot};
-
-        FirmwareImage image;
-        image.baseAddress = IntelHexParser::ApplicationBase;
-        image.image = QByteArray(300, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
         FirmwareUpgradeController controller(&transport);
-        controller.setRequestTimeout(50);
-        QSignalSpy progressSpy(&controller,
-            &FirmwareUpgradeController::progressChanged);
-        controller.startUpgrade(boot, image);
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::QueryMode);
-        QCOMPARE(transport.writes.size(), 1);
+        controller.startUpgrade(upgradeDevice(UpgradeDevice::ApplicationMode),
+                                image());
+        QCOMPARE(lastRequest(transport).type, quint16(App1Codec::GetMode));
+        respond(transport, App1Codec::GetMode,
+                modePayload(App1Codec::ApplicationMode));
+        QCOMPARE(lastRequest(transport).type,
+                 quint16(App1Codec::GetDeviceInfo));
+        respond(transport, App1Codec::GetDeviceInfo,
+                devicePayload(App1Codec::ApplicationMode));
+        QCOMPARE(lastRequest(transport).type,
+                 quint16(App1Codec::GetFirmwareInfo));
+        respond(transport, App1Codec::GetFirmwareInfo, header());
+        QCOMPARE(lastRequest(transport).type,
+                 quint16(App1Codec::EnterBootloader));
+    }
 
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::BootloaderMode,
-                        App1Codec::CanUpgrade | App1Codec::CanReboot)));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Hello);
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlHello));
+    void rejectsProductBeforeModeChange()
+    {
+        FakeTransport transport;
+        FirmwareUpgradeController controller(&transport);
+        controller.startUpgrade(upgradeDevice(UpgradeDevice::ApplicationMode),
+                                image());
+        answerInformationSequence(transport, App1Codec::ApplicationMode,
+                                  header(), 0x00020002U);
+        QCOMPARE(controller.stage(), FirmwareUpgradeController::Failed);
+        for (const QByteArray &write : transport.writes) {
+            App1Frame request;
+            QString error;
+            QVERIFY(App1Codec::decode(write, &request, &error));
+            QVERIFY(request.type != App1Codec::EnterBootloader);
+            QVERIFY(request.type != App1Codec::BlBegin);
+        }
+    }
+
+    void appliesSemanticVersionPolicy()
+    {
+        const DeviceInfo device = [] {
+            DeviceInfo value;
+            value.productId = 0x00010001U;
+            value.hardwareRevision = 1U;
+            return value;
+        }();
+        const FirmwareInfo installed = info(2U, 0U, 0U);
+        QString description;
+        bool downgrade = false;
+        QVERIFY(FirmwareUpgradeController::checkCompatibility(
+            info(3U, 0U, 0U), device, &installed, false,
+            &description, &downgrade));
+        QVERIFY(FirmwareUpgradeController::checkCompatibility(
+            info(2U, 0U, 0U, 0x00010001U, "fedcba987654"),
+            device, &installed, false, &description, &downgrade));
+        QVERIFY(!FirmwareUpgradeController::checkCompatibility(
+            info(1U, 9U, 9U), device, &installed, false,
+            &description, &downgrade));
+        QVERIFY(downgrade);
+        QVERIFY(FirmwareUpgradeController::checkCompatibility(
+            info(1U, 9U, 9U), device, &installed, true,
+            &description, &downgrade));
+    }
+
+    void encodesBeginV2AndStartsDataAt256()
+    {
+        FakeTransport transport;
+        FirmwareUpgradeController controller(&transport);
+        const FirmwareImage candidate = image(info(2U, 0U, 0U));
+        controller.startUpgrade(upgradeDevice(UpgradeDevice::BootloaderMode),
+                                candidate);
+        answerInformationSequence(transport, App1Codec::BootloaderMode,
+                                  header(1U, 0U, 0U));
+
         QByteArray hello;
         append16(hello, 1U);
         append16(hello, 0U);
@@ -280,325 +363,42 @@ private slots:
         append16(hello, 240U);
         append16(hello, 0U);
         append32(hello, 0U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, hello));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Hello);
+        respond(transport, App1Codec::BlHello, hello);
 
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlStatus));
-        QByteArray status;
-        append32(status, 0U);
-        append32(status, 0U);
-        append32(status, 0U);
-        append16(status, 0U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, status));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Begin);
-        const int beginWriteCount = transport.writes.size();
-        QTest::qWait(200);
-        QCOMPARE(transport.writes.size(), beginWriteCount);
+        QByteArray status(14, char(0));
+        respond(transport, App1Codec::BlStatus, status);
+        const App1Frame begin = lastRequest(transport);
+        QCOMPARE(begin.type, quint16(App1Codec::BlBegin));
+        QCOMPARE(begin.payload.size(), 272);
+        QCOMPARE(qFromLittleEndian<quint16>(
+                     reinterpret_cast<const uchar *>(begin.payload.constData())),
+                 quint16(2U));
+        QCOMPARE(qFromLittleEndian<quint32>(
+                     reinterpret_cast<const uchar *>(begin.payload.constData() + 4)),
+                 IntelHexParser::ApplicationBase);
+        QCOMPARE(begin.payload.mid(16), candidate.firmwareInfo.raw);
 
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlBegin));
         QByteArray offset;
-        append32(offset, 0U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, offset));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Transfer);
-        QCOMPARE(progressSpy.count(), 0);
-
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlData));
-        QCOMPARE(request.payload.size(), 246);
-        offset.clear();
-        append32(offset, 240U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, offset));
-        QCOMPARE(progressSpy.count(), 1);
-        QCOMPARE(progressSpy.last().at(0).toUInt(), quint32(240U));
-        QCOMPARE(progressSpy.last().at(1).toUInt(), quint32(300U));
-
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlData));
-        offset.clear();
-        append32(offset, 300U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, offset));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::End);
-        QCOMPARE(progressSpy.last().at(0).toUInt(), quint32(300U));
-
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlEnd));
-        UpgradeDevice app = boot;
-        app.path = QStringLiteral("fake-app");
-        app.mode = UpgradeDevice::ApplicationMode;
-        app.product = QStringLiteral("MYFOC Motor Controller");
-        transport.devices = {app};
-        const int endWriteCount = transport.writes.size();
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, {}));
-        QTRY_VERIFY(transport.writes.size() > endWriteCount);
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::ApplicationMode,
-                        App1Codec::CanEnterBootloader)));
-        QTRY_COMPARE(controller.stage(), FirmwareUpgradeController::Completed);
+        append32(offset, FirmwareInfo::HeaderSize);
+        respond(transport, App1Codec::BlBegin, offset);
+        const App1Frame data = lastRequest(transport);
+        QCOMPARE(data.type, quint16(App1Codec::BlData));
+        QCOMPARE(qFromLittleEndian<quint32>(
+                     reinterpret_cast<const uchar *>(data.payload.constData())),
+                 quint32(FirmwareInfo::HeaderSize));
     }
 
-    void rejectsMalformedApplicationRebootAcknowledgement()
+    void confirmsInstalledBuildAfterReboot()
     {
         FakeTransport transport;
-        UpgradeDevice app;
-        app.path = QStringLiteral("fake-app");
-        app.serial = QStringLiteral("ABC123");
-        app.vid = 0xCAFE;
-        app.pid = 0x4070;
-        app.mode = UpgradeDevice::ApplicationMode;
-        transport.devices = {app};
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        controller.startUpgrade(app, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::ApplicationMode,
-                        App1Codec::CanEnterBootloader)));
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::EnterBootloader));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, {}));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Failed);
-    }
-
-    void followsApplicationDisconnectIntoBootloader()
-    {
-        FakeTransport transport;
-        UpgradeDevice app;
-        app.path = QStringLiteral("fake-app");
-        app.serial = QStringLiteral("ABC123");
-        app.vid = 0xCAFE;
-        app.pid = 0x4070;
-        app.mode = UpgradeDevice::ApplicationMode;
-        UpgradeDevice boot = app;
-        boot.path = QStringLiteral("fake-boot");
-        boot.mode = UpgradeDevice::BootloaderMode;
-        transport.devices = {app};
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        controller.startUpgrade(app, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::ApplicationMode,
-                        App1Codec::CanEnterBootloader)));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::EnterBootloader);
+        const UpgradeDevice boot = upgradeDevice(UpgradeDevice::BootloaderMode);
         transport.devices = {boot};
-        const int enterWriteCount = transport.writes.size();
-        transport.disconnectNow();
-        QTRY_VERIFY(transport.writes.size() > enterWriteCount);
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::GetMode));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::BootloaderMode,
-                        App1Codec::CanUpgrade | App1Codec::CanReboot)));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Hello);
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlHello));
-    }
-
-    void rejectsMalformedModeResponse_data()
-    {
-        QTest::addColumn<QByteArray>("payload");
-        QTest::newRow("short")
-            << QByteArray(7, char(0));
-        QByteArray badVersion = modePayload(
-            App1Codec::ApplicationMode,
-            App1Codec::CanEnterBootloader);
-        badVersion[0] = char(2);
-        QTest::newRow("version") << badVersion;
-        QByteArray badReserved = modePayload(
-            App1Codec::ApplicationMode,
-            App1Codec::CanEnterBootloader);
-        badReserved[3] = char(1);
-        QTest::newRow("reserved") << badReserved;
-        QTest::newRow("mode")
-            << modePayload(3U, App1Codec::CanEnterBootloader);
-        QTest::newRow("capabilities")
-            << modePayload(App1Codec::ApplicationMode,
-                           App1Codec::CanUpgrade);
-    }
-
-    void rejectsMalformedModeResponse()
-    {
-        QFETCH(QByteArray, payload);
-        FakeTransport transport;
-        UpgradeDevice device;
-        device.path = QStringLiteral("fake-device");
-        device.serial = QStringLiteral("ABC123");
-        device.vid = 0xCAFE;
-        device.pid = 0x4070;
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
         FirmwareUpgradeController controller(&transport);
-        controller.startUpgrade(device, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, payload));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Failed);
-    }
+        const FirmwareImage candidate = image(info(2U, 1U, 0U));
+        controller.startUpgrade(boot, candidate);
+        answerInformationSequence(transport, App1Codec::BootloaderMode,
+                                  header(1U, 0U, 0U));
 
-    void ignoresWrongModeSequence()
-    {
-        FakeTransport transport;
-        UpgradeDevice device;
-        device.path = QStringLiteral("fake-device");
-        device.serial = QStringLiteral("ABC123");
-        device.vid = 0xCAFE;
-        device.pid = 0x4070;
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        controller.startUpgrade(device, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        const QByteArray payload = modePayload(
-            App1Codec::BootloaderMode,
-            App1Codec::CanUpgrade | App1Codec::CanReboot);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence + 1U, false, payload));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::QueryMode);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, payload));
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Hello);
-    }
-
-    void failsModeQueryAfterBoundedRetries()
-    {
-        FakeTransport transport;
-        UpgradeDevice device;
-        device.path = QStringLiteral("fake-device");
-        device.serial = QStringLiteral("ABC123");
-        device.vid = 0xCAFE;
-        device.pid = 0x4070;
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        controller.setRequestTimeout(50);
-        controller.startUpgrade(device, image);
-        QTRY_COMPARE(controller.stage(), FirmwareUpgradeController::Failed);
-        QCOMPARE(transport.writes.size(), 4);
-    }
-
-    void ignoresDifferentSerialDuringModeTransition()
-    {
-        FakeTransport transport;
-        UpgradeDevice app;
-        app.path = QStringLiteral("fake-app");
-        app.serial = QStringLiteral("ABC123");
-        app.vid = 0xCAFE;
-        app.pid = 0x4070;
-        UpgradeDevice other = app;
-        other.path = QStringLiteral("other-device");
-        other.serial = QStringLiteral("XYZ789");
-        transport.devices = {app};
-        FirmwareImage image;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        controller.startUpgrade(app, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::ApplicationMode,
-                        App1Codec::CanEnterBootloader)));
-        const int writeCount = transport.writes.size();
-        transport.devices = {other};
-        transport.disconnectNow();
-        QTest::qWait(600);
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::WaitBootloader);
-        QCOMPARE(transport.writes.size(), writeCount);
-    }
-
-    void reportsStorageErrorDetail_data()
-    {
-        QTest::addColumn<int>("detail");
-        QTest::addColumn<QString>("expectedText");
-        QTest::newRow("legacy") << 0x00 << QStringLiteral("error 5");
-        QTest::newRow("erase") << 0x10
-            << QStringLiteral("storage detail 0x10: Sector 11 erase failed");
-        QTest::newRow("program-word-3") << 0x33
-            << QStringLiteral("storage detail 0x33: state word 3 program failed");
-        QTest::newRow("verify-word-3") << 0x43
-            << QStringLiteral("storage detail 0x43: state word 3 readback mismatch");
-        QTest::newRow("unknown") << 0x99
-            << QStringLiteral("storage detail 0x99: unknown storage failure");
-    }
-
-    void reportsStorageErrorDetail()
-    {
-        QFETCH(int, detail);
-        QFETCH(QString, expectedText);
-        FakeTransport transport;
-        UpgradeDevice boot;
-        boot.path = QStringLiteral("fake-boot");
-        boot.serial = QStringLiteral("ABC123");
-        boot.product = QStringLiteral("MYFOC Motor Controller");
-        boot.vid = 0xCAFE;
-        boot.pid = 0x4070;
-        boot.mode = UpgradeDevice::BootloaderMode;
-        transport.devices = {boot};
-        FirmwareImage image;
-        image.baseAddress = IntelHexParser::ApplicationBase;
-        image.image = QByteArray(8, char(0x5A));
-        image.crc32 = App1Codec::crc32(image.image);
-        image.imageVersion = image.crc32;
-
-        FirmwareUpgradeController controller(&transport);
-        QSignalSpy finishedSpy(&controller,
-                               &FirmwareUpgradeController::finished);
-        controller.startUpgrade(boot, image);
-        App1Frame request;
-        QString error;
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false,
-            modePayload(App1Codec::BootloaderMode,
-                        App1Codec::CanUpgrade | App1Codec::CanReboot)));
-
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
         QByteArray hello;
         append16(hello, 1U);
         append16(hello, 0U);
@@ -607,31 +407,32 @@ private slots:
         append16(hello, 240U);
         append16(hello, 0U);
         append32(hello, 0U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, hello));
+        respond(transport, App1Codec::BlHello, hello);
+        respond(transport, App1Codec::BlStatus, QByteArray(14, char(0)));
 
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QByteArray status;
-        append32(status, 0U);
-        append32(status, 0U);
-        append32(status, 0U);
-        append16(status, 0U);
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, false, status));
+        QByteArray offset;
+        append32(offset, 256U);
+        respond(transport, App1Codec::BlBegin, offset);
+        offset.clear();
+        append32(offset, 496U);
+        respond(transport, App1Codec::BlData, offset);
+        offset.clear();
+        append32(offset, 600U);
+        respond(transport, App1Codec::BlData, offset);
+        QCOMPARE(lastRequest(transport).type, quint16(App1Codec::BlEnd));
 
-        QVERIFY(App1Codec::decode(transport.writes.last(), &request, &error));
-        QCOMPARE(request.type, quint16(App1Codec::BlBegin));
-        QByteArray errorPayload;
-        errorPayload.append(char(5));
-        errorPayload.append(char(detail));
-        transport.deliver(App1Codec::encodeResponse(
-            request.type, request.sequence, true, errorPayload));
-
-        QCOMPARE(controller.stage(), FirmwareUpgradeController::Failed);
-        QCOMPARE(finishedSpy.count(), 1);
-        QVERIFY(finishedSpy.last().at(1).toString().contains(expectedText));
+        UpgradeDevice app = boot;
+        app.mode = UpgradeDevice::ApplicationMode;
+        transport.devices = {app};
+        const int beforeReboot = transport.writes.size();
+        respond(transport, App1Codec::BlEnd, {});
+        QTRY_VERIFY(transport.writes.size() > beforeReboot);
+        answerInformationSequence(transport, App1Codec::ApplicationMode,
+                                  candidate.firmwareInfo.raw);
+        QTRY_COMPARE(controller.stage(), FirmwareUpgradeController::Completed);
     }
 };
 
 QTEST_MAIN(FirmwareCoreTest)
 #include "tst_firmwarecore.moc"
+

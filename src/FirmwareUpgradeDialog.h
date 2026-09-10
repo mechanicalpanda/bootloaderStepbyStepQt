@@ -6,6 +6,7 @@
 
 #include <QDialog>
 
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -30,12 +31,19 @@ private slots:
                      const QString &description);
     void updateProgress(quint32 acknowledged, quint32 total,
                         double bytesPerSecond, int etaSeconds);
+    void updateDeviceInformation(const DeviceInfo &device,
+                                 const FirmwareInfo &installed,
+                                 bool installedValid,
+                                 const QString &compatibility,
+                                 bool upgradeAllowed,
+                                 bool downgrade);
     void upgradeFinished(bool success, const QString &message);
     void appendLog(const QString &message);
 
 private:
     void setUpgradeActive(bool active);
     static QString formatBytes(quint32 bytes);
+    static QString formatFirmwareInfo(const FirmwareInfo &info);
 
     WinUsbTransport m_transport;
     FirmwareUpgradeController m_controller;
@@ -48,6 +56,10 @@ private:
     QLineEdit *m_filePathEdit = nullptr;
     QPushButton *m_browseButton = nullptr;
     QLabel *m_fileSummaryLabel = nullptr;
+    QLabel *m_candidateInfoLabel = nullptr;
+    QLabel *m_deviceInfoLabel = nullptr;
+    QLabel *m_compatibilityLabel = nullptr;
+    QCheckBox *m_allowDowngradeCheck = nullptr;
     QLabel *m_phaseLabel = nullptr;
     QProgressBar *m_progressBar = nullptr;
     QLabel *m_bytesLabel = nullptr;

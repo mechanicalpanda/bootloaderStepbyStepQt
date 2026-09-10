@@ -4,40 +4,36 @@
 
 namespace {
 constexpr int BeginResponseTimeoutMs = 20000;
-
-QString storageErrorText(quint8 detail)
-{
-    if (detail == 0x01U)
-        return QStringLiteral("state storage argument or port invalid");
-    if (detail == 0x10U)
-        return QStringLiteral("Sector 11 erase failed");
-    if (detail == 0x20U)
-        return QStringLiteral("state storage capacity exhausted");
-    if (detail >= 0x30U && detail <= 0x37U)
-        return QStringLiteral("state word %1 program failed").arg(detail - 0x30U);
-    if (detail >= 0x40U && detail <= 0x47U)
-        return QStringLiteral("state word %1 readback mismatch").arg(detail - 0x40U);
-    return QStringLiteral("unknown storage failure");
-}
+constexpr quint8 FirmwareInfoInvalidDetail = 0x40U;
 
 QString deviceErrorText(const App1Frame &response)
 {
-    if (response.type == App1Codec::EnterBootloader)
-        return QString::fromLatin1(response.payload);
-
     const int result = response.payload.isEmpty()
         ? -1 : quint8(response.payload.at(0));
-    if (result != 5 || response.payload.size() < 2) {
+    if (response.payload.size() < 2)
         return QStringLiteral("error %1").arg(result);
+    const quint8 detail = quint8(response.payload.at(1));
+    QString meaning = QStringLiteral("unknown detail");
+    if (response.type == App1Codec::BlBegin) {
+        switch (detail) {
+        case 0x40U: meaning = QStringLiteral("firmware information invalid"); break;
+        case 0x41U: meaning = QStringLiteral("product ID mismatch"); break;
+        case 0x42U: meaning = QStringLiteral("hardware revision incompatible"); break;
+        case 0x43U: meaning = QStringLiteral("image base mismatch"); break;
+        case 0x44U: meaning = QStringLiteral("vector base mismatch"); break;
+        case 0x45U: meaning = QStringLiteral("image range invalid"); break;
+        case 0x46U: meaning = QStringLiteral("stored header mismatch"); break;
+        case 0x47U: meaning = QStringLiteral("device identity invalid"); break;
+        default: break;
+        }
+    } else if (detail == 0x10U) {
+        meaning = QStringLiteral("Sector 11 erase failed");
+    } else if (detail >= 0x30U && detail <= 0x37U) {
+        meaning = QStringLiteral("state word %1 program failed")
+            .arg(detail - 0x30U);
     }
-
-    const quint8 storageDetail = quint8(response.payload.at(1));
-    if (storageDetail == 0U)
-        return QStringLiteral("error %1").arg(result);
-    return QStringLiteral("error %1, storage detail 0x%2: %3")
-        .arg(result)
-        .arg(storageDetail, 2, 16, QLatin1Char('0'))
-        .arg(storageErrorText(storageDetail));
+    return QStringLiteral("error %1, detail 0x%2: %3")
+        .arg(result).arg(detail, 2, 16, QLatin1Char('0')).arg(meaning);
 }
 }
 
@@ -46,6 +42,8 @@ FirmwareUpgradeController::FirmwareUpgradeController(
     : QObject(parent), m_transport(transport)
 {
     Q_ASSERT(m_transport);
+    qRegisterMetaType<DeviceInfo>();
+    qRegisterMetaType<FirmwareInfo>();
     m_requestTimer.setSingleShot(true);
     m_requestTimer.setInterval(1000);
     m_transitionTimer.setInterval(250);
@@ -73,6 +71,53 @@ void FirmwareUpgradeController::setRequestTimeout(int milliseconds)
     m_requestTimeoutMs = qMax(50, milliseconds);
 }
 
+bool FirmwareUpgradeController::checkCompatibility(
+    const FirmwareInfo &candidate, const DeviceInfo &device,
+    const FirmwareInfo *installed, bool allowDowngrade,
+    QString *description, bool *downgrade)
+{
+    if (downgrade)
+        *downgrade = false;
+    if (candidate.productId != device.productId) {
+        if (description)
+            *description = QStringLiteral("产品 ID 不匹配");
+        return false;
+    }
+    if (device.hardwareRevision < candidate.hardwareRevisionMinimum
+        || device.hardwareRevision > candidate.hardwareRevisionMaximum) {
+        if (description)
+            *description = QStringLiteral("硬件版本不在固件兼容范围内");
+        return false;
+    }
+    if (installed) {
+        const int order = FirmwareInfo::compareSemanticVersion(
+            candidate, *installed);
+        if (order < 0) {
+            if (downgrade)
+                *downgrade = true;
+            if (!allowDowngrade) {
+                if (description)
+                    *description = QStringLiteral("候选版本较低，默认禁止降级");
+                return false;
+            }
+            if (description)
+                *description = QStringLiteral("已明确允许固件降级");
+            return true;
+        }
+        if (order == 0) {
+            if (description) {
+                *description = candidate.gitCommit == installed->gitCommit
+                    ? QStringLiteral("相同版本，可重新安装")
+                    : QStringLiteral("相同版本的不同构建，可重新安装");
+            }
+            return true;
+        }
+    }
+    if (description)
+        *description = QStringLiteral("产品与硬件兼容，可以升级");
+    return true;
+}
+
 void FirmwareUpgradeController::refreshDevices()
 {
     if (isActive())
@@ -95,9 +140,10 @@ void FirmwareUpgradeController::startUpgrade(const UpgradeDevice &device,
 {
     if (isActive())
         return;
-    if (image.image.isEmpty()
-        || image.image.size() > int(IntelHexParser::ApplicationSize)) {
-        fail(QStringLiteral("Firmware image is empty or too large."));
+    if (image.image.size() <= FirmwareInfo::HeaderSize
+        || image.image.size() > int(IntelHexParser::ApplicationSize)
+        || image.firmwareInfo.raw.size() != FirmwareInfo::HeaderSize) {
+        fail(QStringLiteral("Firmware image or information header is invalid."));
         return;
     }
     m_initialDevice = device;
@@ -110,6 +156,7 @@ void FirmwareUpgradeController::startUpgrade(const UpgradeDevice &device,
     m_sentEnd = 0U;
     m_blockSize = 240U;
     m_retryCount = 0;
+    m_installedFirmwareValid = false;
     setStage(QueryMode, QStringLiteral("Querying device mode"));
     (void)beginModeProbe(device, StartProbe, true);
 }
@@ -150,16 +197,6 @@ void FirmwareUpgradeController::fail(const QString &message)
     emit finished(false, message);
 }
 
-bool FirmwareUpgradeController::openDevice(const UpgradeDevice &device)
-{
-    QString error;
-    if (!m_transport->open(device, &error)) {
-        fail(error.isEmpty() ? QStringLiteral("Unable to open device.") : error);
-        return false;
-    }
-    return true;
-}
-
 bool FirmwareUpgradeController::beginModeProbe(
     const UpgradeDevice &device, ProbePurpose purpose, bool fatalOpenError)
 {
@@ -196,8 +233,7 @@ bool FirmwareUpgradeController::beginModeProbe(
 void FirmwareUpgradeController::probeNextRefreshDevice()
 {
     while (m_refreshIndex < m_refreshCandidates.size()) {
-        const UpgradeDevice candidate =
-            m_refreshCandidates.at(m_refreshIndex++);
+        const UpgradeDevice candidate = m_refreshCandidates.at(m_refreshIndex++);
         if (beginModeProbe(candidate, RefreshProbe, false))
             return;
     }
@@ -205,8 +241,7 @@ void FirmwareUpgradeController::probeNextRefreshDevice()
     emit devicesChanged(m_refreshResolved);
 }
 
-void FirmwareUpgradeController::handleModeProbeFailure(
-    const QString &message)
+void FirmwareUpgradeController::handleProbeFailure(const QString &message)
 {
     const ProbePurpose purpose = m_probePurpose;
     m_requestTimer.stop();
@@ -241,16 +276,22 @@ bool FirmwareUpgradeController::applyModeResponse(
     }
     const quint8 mode = quint8(payload.at(2));
     const quint32 capabilities = read32(payload, 4);
-    if (mode == App1Codec::ApplicationMode
-        && capabilities == App1Codec::CanEnterBootloader) {
+    quint32 required = App1Codec::CanQueryDeviceInfo
+                     | App1Codec::CanQueryFirmwareInfo;
+    if (mode == App1Codec::ApplicationMode) {
+        required |= App1Codec::CanEnterBootloader;
         device->mode = UpgradeDevice::ApplicationMode;
-    } else if (mode == App1Codec::BootloaderMode
-               && capabilities
-                      == (App1Codec::CanUpgrade | App1Codec::CanReboot)) {
+    } else if (mode == App1Codec::BootloaderMode) {
+        required |= App1Codec::CanUpgrade | App1Codec::CanReboot;
         device->mode = UpgradeDevice::BootloaderMode;
     } else {
         if (error)
-            *error = QStringLiteral("GET_MODE mode or capabilities are invalid.");
+            *error = QStringLiteral("GET_MODE mode is invalid.");
+        return false;
+    }
+    if ((capabilities & required) != required) {
+        if (error)
+            *error = QStringLiteral("Device does not support information queries.");
         return false;
     }
     device->capabilities = capabilities;
@@ -273,8 +314,7 @@ bool FirmwareUpgradeController::writeRequest(quint16 type,
 {
     m_pendingType = type;
     m_pendingSequence = ++m_sequence;
-    m_pendingFrame = App1Codec::encodeRequest(
-        type, m_pendingSequence, payload);
+    m_pendingFrame = App1Codec::encodeRequest(type, m_pendingSequence, payload);
     if (m_pendingFrame.isEmpty()
         || !m_transport->write(m_pendingFrame, error))
         return false;
@@ -285,6 +325,61 @@ bool FirmwareUpgradeController::writeRequest(quint16 type,
             : m_requestTimeoutMs);
     m_requestTimer.start();
     return true;
+}
+
+void FirmwareUpgradeController::finishInformationProbe(bool installedValid)
+{
+    m_installedFirmwareValid = installedValid;
+    QString compatibility;
+    bool downgrade = false;
+    const bool allowed = checkCompatibility(
+        m_image.firmwareInfo, m_deviceInfo,
+        installedValid ? &m_installedFirmware : nullptr,
+        m_allowDowngrade, &compatibility, &downgrade);
+    emit deviceInformationChanged(m_deviceInfo, m_installedFirmware,
+                                  installedValid, compatibility,
+                                  allowed, downgrade);
+    const ProbePurpose purpose = m_probePurpose;
+    m_probePurpose = NoProbe;
+
+    if (purpose == WaitApplicationProbe) {
+        m_transport->close();
+        if (m_probeDevice.mode != UpgradeDevice::ApplicationMode) {
+            QTimer::singleShot(0, this,
+                               &FirmwareUpgradeController::scanForTransition);
+            return;
+        }
+        if (!installedValid
+            || !m_image.firmwareInfo.sameBuildIdentity(m_installedFirmware)) {
+            fail(QStringLiteral(
+                "Post-upgrade firmware identity verification failed."));
+            return;
+        }
+        m_transitionTimer.stop();
+        setStage(Completed, QStringLiteral("Firmware upgrade completed"));
+        emit finished(true, QStringLiteral(
+            "Firmware upgrade and version verification completed."));
+        return;
+    }
+    if (!allowed) {
+        fail(QStringLiteral("Compatibility check failed: %1")
+             .arg(compatibility));
+        return;
+    }
+    if (m_image.firmwareInfo.isDebugBuild())
+        emit logMessage(QStringLiteral("Warning: candidate is a Debug build."));
+    if (m_image.firmwareInfo.isDirty())
+        emit logMessage(QStringLiteral("Warning: candidate was built from a dirty tree."));
+
+    if (m_probeDevice.mode == UpgradeDevice::ApplicationMode) {
+        setStage(EnterBootloader, QStringLiteral("Requesting Bootloader mode"));
+        sendRequest(App1Codec::EnterBootloader);
+    } else if (purpose == StartProbe || purpose == WaitBootloaderProbe) {
+        m_transitionTimer.stop();
+        sendHello();
+    } else {
+        fail(QStringLiteral("Unexpected information-query state."));
+    }
 }
 
 void FirmwareUpgradeController::sendHello()
@@ -301,9 +396,12 @@ void FirmwareUpgradeController::sendStatus()
 void FirmwareUpgradeController::sendBegin()
 {
     QByteArray payload;
+    append16(payload, 2U);
+    append16(payload, FirmwareInfo::HeaderSize);
+    append32(payload, m_image.baseAddress);
     append32(payload, quint32(m_image.image.size()));
     append32(payload, m_image.crc32);
-    append32(payload, m_image.imageVersion);
+    payload.append(m_image.firmwareInfo.raw);
     setStage(Begin, QStringLiteral("Starting firmware transaction"));
     sendRequest(App1Codec::BlBegin, payload);
 }
@@ -352,59 +450,73 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         return;
     }
     m_requestTimer.stop();
+
     if (response.type == App1Codec::GetMode) {
         if ((response.flags & App1Codec::ErrorFlag) != 0U) {
-            handleModeProbeFailure(
-                QStringLiteral("Device rejected GET_MODE."));
+            handleProbeFailure(QStringLiteral("Device rejected GET_MODE."));
             return;
         }
         UpgradeDevice resolved = m_probeDevice;
         QString error;
         if (!applyModeResponse(response.payload, &resolved, &error)) {
-            handleModeProbeFailure(error);
+            handleProbeFailure(error);
             return;
         }
-
-        const ProbePurpose purpose = m_probePurpose;
-        m_probePurpose = NoProbe;
-        if (purpose == RefreshProbe) {
+        m_probeDevice = resolved;
+        if (m_probePurpose == RefreshProbe) {
+            m_probePurpose = NoProbe;
             m_transport->close();
             m_refreshResolved.append(resolved);
             probeNextRefreshDevice();
-        } else if (purpose == StartProbe) {
-            m_initialDevice = resolved;
-            m_serial = resolved.serial;
-            if (resolved.mode == UpgradeDevice::ApplicationMode) {
-                setStage(EnterBootloader,
-                         QStringLiteral("Requesting Bootloader mode"));
-                sendRequest(App1Codec::EnterBootloader);
-            } else {
-                sendHello();
-            }
-        } else if (purpose == WaitBootloaderProbe) {
-            if (resolved.mode == UpgradeDevice::BootloaderMode) {
-                m_transitionTimer.stop();
-                sendHello();
-            } else {
-                m_transport->close();
-                QTimer::singleShot(
-                    0, this, &FirmwareUpgradeController::scanForTransition);
-            }
-        } else if (purpose == WaitApplicationProbe) {
-            m_transport->close();
-            if (resolved.mode == UpgradeDevice::ApplicationMode) {
-                m_transitionTimer.stop();
-                setStage(Completed,
-                         QStringLiteral("Firmware upgrade completed"));
-                emit finished(
-                    true, QStringLiteral("Firmware upgrade completed."));
-            } else {
-                QTimer::singleShot(
-                    0, this, &FirmwareUpgradeController::scanForTransition);
-            }
-        } else {
-            fail(QStringLiteral("Unexpected GET_MODE response."));
+            return;
         }
+        setStage(QueryDeviceInformation,
+                 QStringLiteral("Reading device identity"));
+        sendRequest(App1Codec::GetDeviceInfo);
+        return;
+    }
+
+    if (response.type == App1Codec::GetDeviceInfo) {
+        if ((response.flags & App1Codec::ErrorFlag) != 0U) {
+            handleProbeFailure(QStringLiteral("Device rejected GET_DEVICE_INFO."));
+            return;
+        }
+        QString error;
+        if (!DeviceInfo::decode(response.payload, &m_deviceInfo, &error)
+            || m_deviceInfo.mode != (m_probeDevice.isApplication()
+                                     ? App1Codec::ApplicationMode
+                                     : App1Codec::BootloaderMode)) {
+            handleProbeFailure(error.isEmpty()
+                ? QStringLiteral("Device mode responses disagree.") : error);
+            return;
+        }
+        setStage(QueryFirmwareInformation,
+                 QStringLiteral("Reading installed firmware information"));
+        sendRequest(App1Codec::GetFirmwareInfo);
+        return;
+    }
+
+    if (response.type == App1Codec::GetFirmwareInfo) {
+        if ((response.flags & App1Codec::ErrorFlag) != 0U) {
+            const bool absent = m_probeDevice.isBootloader()
+                && response.payload.size() >= 2
+                && quint8(response.payload.at(1)) == FirmwareInfoInvalidDetail;
+            if (!absent) {
+                handleProbeFailure(
+                    QStringLiteral("Device rejected GET_FIRMWARE_INFO."));
+                return;
+            }
+            m_installedFirmware = {};
+            finishInformationProbe(false);
+            return;
+        }
+        QString error;
+        if (!FirmwareInfo::decode(response.payload,
+                                  &m_installedFirmware, &error)) {
+            handleProbeFailure(error);
+            return;
+        }
+        finishInformationProbe(true);
         return;
     }
 
@@ -423,10 +535,12 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
             return;
         }
         m_transport->close();
-        setStage(WaitBootloader, QStringLiteral("Waiting for Bootloader USB device"));
+        setStage(WaitBootloader,
+                 QStringLiteral("Waiting for Bootloader USB device"));
         m_transitionElapsed.restart();
         m_transitionTimer.start();
-        QTimer::singleShot(0, this, &FirmwareUpgradeController::scanForTransition);
+        QTimer::singleShot(0, this,
+                           &FirmwareUpgradeController::scanForTransition);
         break;
     case App1Codec::BlHello:
         if (response.payload.size() < 20
@@ -453,7 +567,8 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         const quint16 state = read16(response.payload, 12);
         if (state == 1U
             && (size != quint32(m_image.image.size()) || crc != m_image.crc32)) {
-            setStage(Begin, QStringLiteral("Discarding a different interrupted image"));
+            setStage(Begin,
+                     QStringLiteral("Discarding a different interrupted image"));
             sendRequest(App1Codec::BlAbort);
         } else {
             sendBegin();
@@ -469,14 +584,14 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
             return;
         }
         m_offset = read32(response.payload, 0);
-        if (m_offset > quint32(m_image.image.size())) {
+        if (m_offset < FirmwareInfo::HeaderSize
+            || m_offset > quint32(m_image.image.size())) {
             fail(QStringLiteral("Bootloader resume offset is outside the image."));
             return;
         }
         m_transferStartOffset = m_offset;
         m_transferElapsed.restart();
-        if (m_offset != 0U)
-            updateProgress(m_offset);
+        updateProgress(m_offset);
         sendNextData();
         break;
     case App1Codec::BlData: {
@@ -498,10 +613,12 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
     }
     case App1Codec::BlEnd:
         m_transport->close();
-        setStage(WaitApplication, QStringLiteral("Waiting for upgraded application"));
+        setStage(WaitApplication,
+                 QStringLiteral("Waiting for upgraded application"));
         m_transitionElapsed.restart();
         m_transitionTimer.start();
-        QTimer::singleShot(0, this, &FirmwareUpgradeController::scanForTransition);
+        QTimer::singleShot(0, this,
+                           &FirmwareUpgradeController::scanForTransition);
         break;
     default:
         fail(QStringLiteral("Unexpected Bootloader response."));
@@ -522,7 +639,7 @@ void FirmwareUpgradeController::updateProgress(quint32 acknowledged)
 void FirmwareUpgradeController::onTransportError(const QString &message)
 {
     if (m_probePurpose != NoProbe)
-        handleModeProbeFailure(message);
+        handleProbeFailure(message);
     else if (isActive())
         fail(message);
 }
@@ -531,8 +648,8 @@ void FirmwareUpgradeController::onDisconnected()
 {
     m_requestTimer.stop();
     if (m_probePurpose != NoProbe) {
-        handleModeProbeFailure(
-            QStringLiteral("Device disconnected during GET_MODE."));
+        handleProbeFailure(QStringLiteral(
+            "Device disconnected during information query."));
         return;
     }
     if (m_stage == EnterBootloader) {
@@ -549,25 +666,24 @@ void FirmwareUpgradeController::onDisconnected()
     }
     m_transitionElapsed.restart();
     m_transitionTimer.start();
-    QTimer::singleShot(0, this, &FirmwareUpgradeController::scanForTransition);
+    QTimer::singleShot(0, this,
+                       &FirmwareUpgradeController::scanForTransition);
 }
 
 void FirmwareUpgradeController::onRequestTimeout()
 {
     if (++m_retryCount > 3) {
-        if (m_pendingType == App1Codec::GetMode
-            && m_probePurpose != NoProbe) {
-            handleModeProbeFailure(
-                QStringLiteral("GET_MODE response timeout."));
-        } else {
+        if (m_probePurpose != NoProbe)
+            handleProbeFailure(QStringLiteral("Device query response timeout."));
+        else
             fail(QStringLiteral("USB response timeout."));
-        }
         return;
     }
     QString error;
     emit logMessage(QStringLiteral("Response timeout, retransmitting command."));
     if (!m_transport->write(m_pendingFrame, &error)) {
-        fail(error.isEmpty() ? QStringLiteral("USB retransmission failed.") : error);
+        fail(error.isEmpty()
+             ? QStringLiteral("USB retransmission failed.") : error);
         return;
     }
     m_requestTimer.start();

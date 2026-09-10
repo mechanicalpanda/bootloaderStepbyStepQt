@@ -2,6 +2,7 @@
 #define FIRMWAREUPGRADECONTROLLER_H
 
 #include "App1Codec.h"
+#include "DeviceInfo.h"
 #include "IntelHexParser.h"
 #include "UpgradeTransport.h"
 
@@ -18,6 +19,8 @@ public:
         Idle,
         ValidateFile,
         QueryMode,
+        QueryDeviceInformation,
+        QueryFirmwareInformation,
         EnterBootloader,
         WaitBootloader,
         Hello,
@@ -40,6 +43,14 @@ public:
     void startUpgrade(const UpgradeDevice &device, const FirmwareImage &image);
     void cancel();
     void setRequestTimeout(int milliseconds);
+    void setAllowDowngrade(bool allow) { m_allowDowngrade = allow; }
+
+    static bool checkCompatibility(const FirmwareInfo &candidate,
+                                   const DeviceInfo &device,
+                                   const FirmwareInfo *installed,
+                                   bool allowDowngrade,
+                                   QString *description,
+                                   bool *downgrade);
 
 signals:
     void devicesChanged(const QList<UpgradeDevice> &devices);
@@ -47,6 +58,12 @@ signals:
                       const QString &description);
     void progressChanged(quint32 acknowledgedBytes, quint32 totalBytes,
                          double bytesPerSecond, int etaSeconds);
+    void deviceInformationChanged(const DeviceInfo &device,
+                                  const FirmwareInfo &installed,
+                                  bool installedValid,
+                                  const QString &compatibility,
+                                  bool upgradeAllowed,
+                                  bool downgrade);
     void logMessage(const QString &message);
     void finished(bool success, const QString &message);
 
@@ -69,17 +86,17 @@ private:
 
     void setStage(Stage stage, const QString &description);
     void fail(const QString &message);
-    bool openDevice(const UpgradeDevice &device);
     bool writeRequest(quint16 type, const QByteArray &payload,
                       QString *error);
     void sendRequest(quint16 type, const QByteArray &payload = {});
     bool beginModeProbe(const UpgradeDevice &device, ProbePurpose purpose,
                         bool fatalOpenError);
     void probeNextRefreshDevice();
-    void handleModeProbeFailure(const QString &message);
+    void handleProbeFailure(const QString &message);
     bool applyModeResponse(const QByteArray &payload, UpgradeDevice *device,
                            QString *error) const;
     void handleResponse(const App1Frame &response);
+    void finishInformationProbe(bool installedValid);
     void sendHello();
     void sendStatus();
     void sendBegin();
@@ -98,6 +115,8 @@ private:
     QList<UpgradeDevice> m_refreshCandidates;
     QList<UpgradeDevice> m_refreshResolved;
     FirmwareImage m_image;
+    DeviceInfo m_deviceInfo;
+    FirmwareInfo m_installedFirmware;
     QString m_serial;
     QByteArray m_rxStream;
     QByteArray m_pendingFrame;
@@ -112,10 +131,15 @@ private:
     int m_refreshIndex = 0;
     int m_requestTimeoutMs = 1000;
     ProbePurpose m_probePurpose = NoProbe;
+    bool m_allowDowngrade = false;
+    bool m_installedFirmwareValid = false;
     QTimer m_requestTimer;
     QTimer m_transitionTimer;
     QElapsedTimer m_transitionElapsed;
     QElapsedTimer m_transferElapsed;
 };
+
+Q_DECLARE_METATYPE(DeviceInfo)
+Q_DECLARE_METATYPE(FirmwareInfo)
 
 #endif // FIRMWAREUPGRADECONTROLLER_H
