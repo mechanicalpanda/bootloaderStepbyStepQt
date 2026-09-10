@@ -1,60 +1,54 @@
 # MYFOC 固件升级上位机
 
-这是 STM32F407IGT6 Bootloader 的 Qt 5.14.2 / WinUSB 升级工具。设备同时枚举 CDC 和 Vendor-specific WinUSB Bulk；上位机的升级通道只使用 WinUSB。
+这是 STM32F407IGT6 的 Qt 5.14.2 / WinUSB 固件升级工具。它读取 Intel HEX 内的固件身份，连接设备后再次读取设备身份与已安装固件，在任何擦除操作之前完成兼容性判断。
 
-## 功能
+## 操作流程
 
-- Application 与 Bootloader 使用完全相同的 USB 身份（VID/PID CAFE:4070）和接口布局，避免模式切换后重新安装驱动。
-- “刷新设备”会实际打开每个 WinUSB 接口并发送 `GET_MODE`，根据响应显示 Application 或 Bootloader，不根据 PID 猜测模式。
-- 使用 Windows 文件管理器选择 .hex / .ihx 文件。
-- 校验 Intel HEX checksum、地址范围、重叠记录和 Cortex-M4 向量表。
-- Application 在线切换到 Bootloader，并按相同 STM32 UID 序列号重新匹配设备。
-- 支持断点恢复、超时重传、取消升级、整镜像 CRC32 和向量表复核。
-- 显示阶段、已确认字节、百分比、速度、预计剩余时间和事件记录。
-- 进度仅根据 Bootloader 的 BL_DATA 确认偏移推进。
+1. 点击“刷新设备”。工具枚举统一 Interface GUID，并发送 `GET_MODE`，不依赖 PID 判断 Application/Bootloader。
+2. 选择 `.hex`。工具严格校验 Intel HEX、完整 256 字节 `FirmwareInfoV1`、CRC32、UTF-8/补零、固定地址和位于 `0x08020200` 的向量表。
+3. 查看候选固件：厂商、设备/固件名、产品 ID、硬件范围、SemVer、build、Git、Debug/Release、dirty、UTC 时间、镜像/向量地址、镜像大小和 CRC32。
+4. 点击“开始升级”。工具依次发送 `GET_MODE → GET_DEVICE_INFO → GET_FIRMWARE_INFO`。
+5. 工具强制核对产品 ID 与硬件版本；SemVer 较低时默认停止，并显示“允许固件降级（仅本次升级）”。勾选后再次点击开始才能降级。
+6. Application 模式先发送 `ENTER_BOOTLOADER`，按同一 STM32 UID 等待 USB 重枚举；Bootloader 模式直接继续。
+7. 工具发送 `BL_HELLO / BL_STATUS / BL_BEGIN V2`，从偏移 256 开始逐块传输；固件头由 BEGIN 携带并由 Bootloader 先校验、后擦除。
+8. `BL_END` 成功后等待 Application，重新查询固件信息；只有 SemVer、build number 和 Git commit 与 HEX 完全一致才显示成功。
 
-## 直接运行
+Debug 或 dirty 固件可用于开发，但界面会显示警告。`Release + dirty` 是非法固件头，加载时直接拒绝。当前 CRC32 仅保证传输完整性，不提供来源认证；正式发布加密/签名包是后续独立阶段。
 
-发布程序位于 deploy\MYFOCFirmwareUpdater.exe。
+## 固定参数
 
-运行前先分别烧录最新 Bootloader 和 Application。Windows 10/11 会根据固件提供的 Microsoft OS 2.0 描述符为接口 2 自动绑定系统自带 WinUSB 驱动；CDC 接口使用系统自带串口驱动，不需要自定义 INF。
+- USB：VID/PID `CAFE:4070`，Application 与 Bootloader 相同。
+- Interface GUID：`{6E15414D-B3E8-4B08-9B73-73DB7E6A0F40}`。
+- WinUSB Interface 2：Bulk OUT `0x01`，Bulk IN `0x81`。
+- APP1：24 字节头，最大 payload 320 字节。
+- Application：`0x08020000..0x080DFFFF`。
+- 固件头：`0x08020000..0x080200FF`。
+- 保留擦除区：`0x08020100..0x080201FF`。
+- 向量表：`0x08020200`；普通代码不得低于 `0x08020400`。
+- `BL_DATA` 数据最多 240 字节；BEGIN V2 固定 272 字节。
+- 普通请求超时 1 秒；BEGIN 20 秒；每帧最多重传 3 次；重枚举等待 10 秒。
 
-操作顺序：
+## 构建与测试
 
-1. USB 连接控制器，确保电机处于 IDLE、功率输出关闭。
-2. 启动上位机，点击“刷新设备”，选择目标设备。
-3. 点击“浏览...”选择链接地址为 0x08020000 的 HEX。
-4. 检查文件大小、起始地址和 CRC32 后点击“开始升级”。
-5. 等待进度到 100%，并看到“Firmware upgrade completed”。
+Qt 与 MinGW 必须配套使用：
 
-## 构建
+```powershell
+$env:Path='E:\Qt\Qt5.14.2\Tools\mingw730_64\bin;'+$env:Path
+cd build-release
+E:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe ..\bootloaderQtStepbyStep.pro
+mingw32-make -j4
+```
 
-使用 Qt 5.14.2 MinGW 64-bit，在 build-release 中运行：
+自动化测试：
 
-    E:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe ..\bootloaderQtStepbyStep.pro
-    E:\Qt\Qt5.14.2\Tools\mingw730_64\bin\mingw32-make.exe -j4
+```powershell
+cd build-tests
+E:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe ..\tests\tests.pro
+mingw32-make -j4
+$env:QT_QPA_PLATFORM='offscreen'
+.\release\firmware_core_tests.exe
+```
 
-## 自动化测试
+格式编解码独立测试使用 `tests\firmwareinfo_tests.pro`。实机无人值守冒烟工具使用 `tests\hardware_upgrade_smoke.pro`，参数必须是准备安装的真实 HEX；该程序会实际升级硬件，不能用于损坏样本。
 
-在 build-tests 中运行：
-
-    E:\Qt\Qt5.14.2\5.14.2\mingw73_64\bin\qmake.exe ..\tests\tests.pro
-    E:\Qt\Qt5.14.2\Tools\mingw730_64\bin\mingw32-make.exe -j4
-    $env:QT_QPA_PLATFORM='offscreen'
-    .\release\firmware_core_tests.exe
-
-测试覆盖 HEX 解析、APP1 CRC/跨 USB 包重组、设备身份解析、ACK 驱动进度以及必要界面控件。
-
-## 固定协议参数
-
-- Interface GUID：{6E15414D-B3E8-4B08-9B73-73DB7E6A0F40}
-- USB 身份：VID/PID CAFE:4070，Application 与 Bootloader 一致
-- 模式查询：`GET_MODE = 0x0002`，响应携带协议版本、模式和能力位
-- Bulk OUT / IN：0x01 / 0x81
-- Application 地址：0x08020000..0x080DFFFF
-- APP1 数据块：最大 240 字节
-- 普通请求超时：1 秒；BL_BEGIN 擦除阶段超时：20 秒；同一帧最多重传 3 次
-- USB 重枚举等待：10 秒
-
-完整字节协议见 I:\MYFOC\protocal\Ident\README.md 的“Bootloader 固件升级协议”章节。
-"# bootloaderStepbyStepQt" 
+发布程序位于 `deploy\MYFOCFirmwareUpdater.exe`。完整字节协议见 `I:\MYFOC\protocal\Ident\README.md` 第 17 节。
