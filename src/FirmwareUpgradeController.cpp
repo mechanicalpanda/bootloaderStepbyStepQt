@@ -352,8 +352,6 @@ void FirmwareUpgradeController::finishInformationProbe(bool installedValid)
     if (purpose == WaitApplicationProbe) {
         m_transport->close();
         if (m_probeDevice.mode != UpgradeDevice::ApplicationMode) {
-            QTimer::singleShot(0, this,
-                               &FirmwareUpgradeController::scanForTransition);
             return;
         }
         if (!installedValid
@@ -434,11 +432,8 @@ void FirmwareUpgradeController::sendNextData()
 
 void FirmwareUpgradeController::sendEnd()
 {
-    QByteArray payload;
-    append32(payload, quint32(m_image.image.size()));
-    append32(payload, m_image.crc32);
     setStage(EndStaging, QStringLiteral("Verifying staged W25Q128 image"));
-    sendRequest(App1Codec::BlEnd, payload);
+    sendRequest(App1Codec::BlEnd);
 }
 
 void FirmwareUpgradeController::sendInstall()
@@ -483,6 +478,14 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
             m_transport->close();
             m_refreshResolved.append(resolved);
             probeNextRefreshDevice();
+            return;
+        }
+        if ((m_probePurpose == WaitBootloaderProbe
+             && !resolved.isBootloader())
+            || (m_probePurpose == WaitApplicationProbe
+                && !resolved.isApplication())) {
+            m_probePurpose = NoProbe;
+            m_transport->close();
             return;
         }
         setStage(QueryDeviceInformation,
@@ -694,7 +697,8 @@ void FirmwareUpgradeController::onDisconnected()
     if (m_stage == EnterBootloader) {
         setStage(WaitBootloader,
                  QStringLiteral("Waiting for Bootloader USB device"));
-    } else if (m_stage == EndStaging) {
+    } else if (m_stage == EndStaging || m_stage == MonitorRecovery) {
+        m_recoveryTimer.stop();
         setStage(WaitApplication,
                  QStringLiteral("Waiting for upgraded application"));
     } else if (m_stage == WaitBootloader || m_stage == WaitApplication) {
