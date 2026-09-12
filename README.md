@@ -10,7 +10,7 @@
 4. 点击“开始升级”。工具依次发送 `GET_MODE → GET_DEVICE_INFO → GET_FIRMWARE_INFO`。
 5. 工具强制核对产品 ID 与硬件版本；SemVer 较低时默认停止，并显示“允许固件降级（仅本次升级）”。勾选后再次点击开始才能降级。
 6. Application 模式先发送 `ENTER_BOOTLOADER`，按同一 STM32 UID 等待 USB 重枚举；Bootloader 模式直接继续。
-7. 工具发送 `BL_HELLO / BL_STATUS / BL_BEGIN V2`，从偏移 256 开始逐块传输；固件头由 BEGIN 携带并由 Bootloader 先校验、后擦除。
+7. 工具发送 `BL_HELLO / BL_STATUS / BL_BEGIN V3`，携带稳定 packageId；DATA 每块最多 240 字节且不跨 4 KiB 边界。END 只封存候选，随后发送 INSTALL 并轮询 STATUS V2（48 字节）直至 APP_VALID。
 8. `BL_END` 成功后等待 Application，重新查询固件信息；只有 SemVer、build number 和 Git commit 与 HEX 完全一致才显示成功。
 
 Debug 或 dirty 固件可用于开发，但界面会显示警告。`Release + dirty` 是非法固件头，加载时直接拒绝。当前 CRC32 仅保证传输完整性，不提供来源认证；正式发布加密/签名包是后续独立阶段。
@@ -25,7 +25,7 @@ Debug 或 dirty 固件可用于开发，但界面会显示警告。`Release + di
 - 固件头：`0x08020000..0x080200FF`。
 - 保留擦除区：`0x08020100..0x080201FF`。
 - 向量表：`0x08020200`；普通代码不得低于 `0x08020400`。
-- `BL_DATA` 数据最多 240 字节；BEGIN V2 固定 272 字节。
+- `BL_DATA` 数据最多 240 字节且不得跨 4 KiB 边界；BEGIN V3 固定 288 字节，STATUS V2 固定 48 字节。
 - 普通请求超时 1 秒；BEGIN 20 秒；每帧最多重传 3 次；重枚举等待 10 秒。
 
 ## 构建与测试
