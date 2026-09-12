@@ -24,9 +24,12 @@ public:
         EnterBootloader,
         WaitBootloader,
         Hello,
-        Begin,
-        Transfer,
-        End,
+        Status,
+        BeginStaging,
+        TransferToExternal,
+        EndStaging,
+        Install,
+        MonitorRecovery,
         WaitApplication,
         Completed,
         Failed,
@@ -65,6 +68,10 @@ signals:
                                   bool upgradeAllowed,
                                   bool downgrade);
     void logMessage(const QString &message);
+    void recoveryStatusChanged(quint8 phase, quint8 activeSlot,
+                               quint8 candidateSlot, const QByteArray &packageId,
+                               quint32 downloadOffset, quint32 backupOffset,
+                               quint32 installOffset, quint16 lastError);
     void finished(bool success, const QString &message);
 
 private slots:
@@ -73,6 +80,7 @@ private slots:
     void onDisconnected();
     void onRequestTimeout();
     void scanForTransition();
+    void pollRecovery();
 
 private:
     enum ProbePurpose
@@ -102,6 +110,7 @@ private:
     void sendBegin();
     void sendNextData();
     void sendEnd();
+    void sendInstall();
     void updateProgress(quint32 acknowledged);
     static quint16 read16(const QByteArray &data, int offset);
     static quint32 read32(const QByteArray &data, int offset);
@@ -119,6 +128,7 @@ private:
     FirmwareInfo m_installedFirmware;
     QString m_serial;
     QByteArray m_rxStream;
+    QByteArray m_packageId;
     QByteArray m_pendingFrame;
     quint16 m_pendingType = 0;
     quint32 m_pendingSequence = 0;
@@ -135,6 +145,7 @@ private:
     bool m_installedFirmwareValid = false;
     QTimer m_requestTimer;
     QTimer m_transitionTimer;
+    QTimer m_recoveryTimer;
     QElapsedTimer m_transitionElapsed;
     QElapsedTimer m_transferElapsed;
 };

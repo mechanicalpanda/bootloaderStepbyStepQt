@@ -183,6 +183,14 @@ private:
         return payload;
     }
 
+    static QByteArray statusPayload(quint8 phase = 0U)
+    {
+        QByteArray payload(48, char(0));
+        payload[0] = char(2);
+        payload[2] = char(phase);
+        return payload;
+    }
+
     static UpgradeDevice upgradeDevice(UpgradeDevice::Mode mode)
     {
         UpgradeDevice device;
@@ -345,18 +353,20 @@ private slots:
             &description, &downgrade));
     }
 
-    void encodesBeginV2AndStartsDataAt256()
+    void encodesBeginV3AndNeverCrossesFourKiBBoundary()
     {
         FakeTransport transport;
         FirmwareUpgradeController controller(&transport);
-        const FirmwareImage candidate = image(info(2U, 0U, 0U));
+        FirmwareImage candidate = image(info(2U, 0U, 0U));
+        candidate.image.resize(5000);
+        candidate.crc32 = App1Codec::crc32(candidate.image);
         controller.startUpgrade(upgradeDevice(UpgradeDevice::BootloaderMode),
                                 candidate);
         answerInformationSequence(transport, App1Codec::BootloaderMode,
                                   header(1U, 0U, 0U));
 
         QByteArray hello;
-        append16(hello, 1U);
+        append16(hello, 2U);
         append16(hello, 0U);
         append32(hello, IntelHexParser::ApplicationBase);
         append32(hello, IntelHexParser::ApplicationSize);
@@ -365,27 +375,35 @@ private slots:
         append32(hello, 0U);
         respond(transport, App1Codec::BlHello, hello);
 
-        QByteArray status(14, char(0));
-        respond(transport, App1Codec::BlStatus, status);
+        respond(transport, App1Codec::BlStatus, statusPayload());
         const App1Frame begin = lastRequest(transport);
         QCOMPARE(begin.type, quint16(App1Codec::BlBegin));
-        QCOMPARE(begin.payload.size(), 272);
+        QCOMPARE(begin.payload.size(), 288);
         QCOMPARE(qFromLittleEndian<quint16>(
                      reinterpret_cast<const uchar *>(begin.payload.constData())),
-                 quint16(2U));
+                 quint16(3U));
+        QCOMPARE(qFromLittleEndian<quint16>(
+                     reinterpret_cast<const uchar *>(begin.payload.constData() + 2)),
+                 quint16(FirmwareInfo::HeaderSize));
         QCOMPARE(qFromLittleEndian<quint32>(
                      reinterpret_cast<const uchar *>(begin.payload.constData() + 4)),
                  IntelHexParser::ApplicationBase);
-        QCOMPARE(begin.payload.mid(16), candidate.firmwareInfo.raw);
+        QCOMPARE(begin.payload.mid(16, 16).size(), 16);
+        QVERIFY(begin.payload.mid(16, 16) != QByteArray(16, char(0)));
+        QCOMPARE(begin.payload.mid(32, FirmwareInfo::HeaderSize),
+                 candidate.firmwareInfo.raw);
 
         QByteArray offset;
-        append32(offset, FirmwareInfo::HeaderSize);
+        append32(offset, 4080U);
         respond(transport, App1Codec::BlBegin, offset);
         const App1Frame data = lastRequest(transport);
         QCOMPARE(data.type, quint16(App1Codec::BlData));
         QCOMPARE(qFromLittleEndian<quint32>(
                      reinterpret_cast<const uchar *>(data.payload.constData())),
-                 quint32(FirmwareInfo::HeaderSize));
+                 quint32(4080U));
+        QCOMPARE(qFromLittleEndian<quint16>(
+                     reinterpret_cast<const uchar *>(data.payload.constData() + 4)),
+                 quint16(16U));
     }
 
     void confirmsInstalledBuildAfterReboot()
@@ -400,7 +418,7 @@ private slots:
                                   header(1U, 0U, 0U));
 
         QByteArray hello;
-        append16(hello, 1U);
+        append16(hello, 2U);
         append16(hello, 0U);
         append32(hello, IntelHexParser::ApplicationBase);
         append32(hello, IntelHexParser::ApplicationSize);
@@ -408,7 +426,7 @@ private slots:
         append16(hello, 0U);
         append32(hello, 0U);
         respond(transport, App1Codec::BlHello, hello);
-        respond(transport, App1Codec::BlStatus, QByteArray(14, char(0)));
+        respond(transport, App1Codec::BlStatus, statusPayload());
 
         QByteArray offset;
         append32(offset, 256U);
@@ -421,12 +439,16 @@ private slots:
         respond(transport, App1Codec::BlData, offset);
         QCOMPARE(lastRequest(transport).type, quint16(App1Codec::BlEnd));
 
+        respond(transport, App1Codec::BlEnd, {});
+        QCOMPARE(lastRequest(transport).type, quint16(App1Codec::BlInstall));
+        respond(transport, App1Codec::BlInstall, {});
+        QCOMPARE(controller.stage(), FirmwareUpgradeController::MonitorRecovery);
+        QTRY_COMPARE(lastRequest(transport).type, quint16(App1Codec::BlStatus));
         UpgradeDevice app = boot;
         app.mode = UpgradeDevice::ApplicationMode;
         transport.devices = {app};
-        const int beforeReboot = transport.writes.size();
-        respond(transport, App1Codec::BlEnd, {});
-        QTRY_VERIFY(transport.writes.size() > beforeReboot);
+        respond(transport, App1Codec::BlStatus, statusPayload(1U));
+        QTRY_VERIFY(transport.writes.size() > 0);
         answerInformationSequence(transport, App1Codec::ApplicationMode,
                                   candidate.firmwareInfo.raw);
         QTRY_COMPARE(controller.stage(), FirmwareUpgradeController::Completed);

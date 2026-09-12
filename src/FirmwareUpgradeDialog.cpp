@@ -100,6 +100,10 @@ FirmwareUpgradeDialog::FirmwareUpgradeDialog(QWidget *parent)
     m_phaseLabel = new QLabel(QStringLiteral("就绪"), progressGroup);
     m_phaseLabel->setStyleSheet(QStringLiteral(
         "font-size: 15px; font-weight: 600; color: #1d4ed8;"));
+    m_recoveryLabel = new QLabel(QStringLiteral("暂存/恢复详情：等待 Bootloader STATUS V2"), progressGroup);
+    m_recoveryLabel->setObjectName(QStringLiteral("recoveryDetails"));
+    m_recoveryLabel->setWordWrap(true);
+    m_recoveryLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_progressBar = new QProgressBar(progressGroup);
     m_progressBar->setObjectName(QStringLiteral("upgradeProgress"));
     m_progressBar->setRange(0, 100);
@@ -115,6 +119,7 @@ FirmwareUpgradeDialog::FirmwareUpgradeDialog(QWidget *parent)
     metrics->addWidget(m_etaLabel);
     auto *progressLayout = new QVBoxLayout(progressGroup);
     progressLayout->addWidget(m_phaseLabel);
+    progressLayout->addWidget(m_recoveryLabel);
     progressLayout->addWidget(m_progressBar);
     progressLayout->addLayout(metrics);
 
@@ -189,6 +194,8 @@ FirmwareUpgradeDialog::FirmwareUpgradeDialog(QWidget *parent)
             this, &FirmwareUpgradeDialog::upgradeFinished);
     connect(&m_controller, &FirmwareUpgradeController::logMessage,
             this, &FirmwareUpgradeDialog::appendLog);
+    connect(&m_controller, &FirmwareUpgradeController::recoveryStatusChanged,
+            this, &FirmwareUpgradeDialog::updateRecoveryStatus);
 
     m_refreshTimer = new QTimer(this);
     m_refreshTimer->setInterval(2000);
@@ -315,6 +322,25 @@ void FirmwareUpgradeDialog::updateProgress(
     m_speedLabel->setText(QStringLiteral("速度：%1 KiB/s")
                          .arg(bytesPerSecond / 1024.0, 0, 'f', 1));
     m_etaLabel->setText(QStringLiteral("剩余：%1 秒").arg(etaSeconds));
+}
+
+void FirmwareUpgradeDialog::updateRecoveryStatus(
+    quint8 phase, quint8 activeSlot, quint8 candidateSlot,
+    const QByteArray &packageId, quint32 downloadOffset, quint32 backupOffset,
+    quint32 installOffset, quint16 lastError)
+{
+    static const QStringList phaseNames = {
+        QStringLiteral("空"), QStringLiteral("APP 有效"), QStringLiteral("下载到 W25Q128"),
+        QStringLiteral("候选已暂存"), QStringLiteral("备份旧 APP"),
+        QStringLiteral("备份完成"), QStringLiteral("写入 STM32 内部 Flash"),
+        QStringLiteral("校验内部 Flash"), QStringLiteral("回滚旧 APP"), QStringLiteral("错误")};
+    const QString phaseText = phase < phaseNames.size() ? phaseNames.at(phase)
+                                                         : QStringLiteral("未知");
+    m_recoveryLabel->setText(QStringLiteral("阶段：%1 · Active 槽：%2 · Candidate 槽：%3 · packageId：%4\nW25Q128 下载：%5 B · 旧 APP 备份：%6 B · STM32 内部 Flash：%7 B · 错误：0x%8")
+        .arg(phaseText).arg(activeSlot).arg(candidateSlot)
+        .arg(QString::fromLatin1(packageId.toHex().toUpper()))
+        .arg(downloadOffset).arg(backupOffset).arg(installOffset)
+        .arg(lastError, 4, 16, QLatin1Char('0')).toUpper());
 }
 
 void FirmwareUpgradeDialog::updateDeviceInformation(

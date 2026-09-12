@@ -1,6 +1,7 @@
 #include "FirmwareUpgradeController.h"
 
 #include <QtEndian>
+#include <QUuid>
 
 namespace {
 constexpr int BeginResponseTimeoutMs = 20000;
@@ -47,10 +48,13 @@ FirmwareUpgradeController::FirmwareUpgradeController(
     m_requestTimer.setSingleShot(true);
     m_requestTimer.setInterval(1000);
     m_transitionTimer.setInterval(250);
+    m_recoveryTimer.setInterval(250);
     connect(&m_requestTimer, &QTimer::timeout,
             this, &FirmwareUpgradeController::onRequestTimeout);
     connect(&m_transitionTimer, &QTimer::timeout,
             this, &FirmwareUpgradeController::scanForTransition);
+    connect(&m_recoveryTimer, &QTimer::timeout,
+            this, &FirmwareUpgradeController::pollRecovery);
     connect(m_transport, &UpgradeTransport::dataReceived,
             this, &FirmwareUpgradeController::onDataReceived);
     connect(m_transport, &UpgradeTransport::transportError,
@@ -151,6 +155,7 @@ void FirmwareUpgradeController::startUpgrade(const UpgradeDevice &device,
     m_image = image;
     m_rxStream.clear();
     m_pendingFrame.clear();
+    m_packageId = QUuid::createUuid().toRfc4122();
     m_sequence = 0U;
     m_offset = 0U;
     m_sentEnd = 0U;
@@ -165,7 +170,8 @@ void FirmwareUpgradeController::cancel()
 {
     if (!isActive())
         return;
-    if (m_stage == Begin || m_stage == Transfer || m_stage == End) {
+    if (m_stage == BeginStaging || m_stage == TransferToExternal
+        || m_stage == EndStaging) {
         const QByteArray abort = App1Codec::encodeRequest(
             App1Codec::BlAbort, ++m_sequence);
         QString ignored;
@@ -173,6 +179,7 @@ void FirmwareUpgradeController::cancel()
     }
     m_requestTimer.stop();
     m_transitionTimer.stop();
+    m_recoveryTimer.stop();
     m_transport->close();
     m_probePurpose = NoProbe;
     setStage(Cancelled, QStringLiteral("Upgrade cancelled"));
@@ -396,13 +403,14 @@ void FirmwareUpgradeController::sendStatus()
 void FirmwareUpgradeController::sendBegin()
 {
     QByteArray payload;
-    append16(payload, 2U);
+    append16(payload, 3U);
     append16(payload, FirmwareInfo::HeaderSize);
     append32(payload, m_image.baseAddress);
     append32(payload, quint32(m_image.image.size()));
     append32(payload, m_image.crc32);
+    payload.append(m_packageId);
     payload.append(m_image.firmwareInfo.raw);
-    setStage(Begin, QStringLiteral("Starting firmware transaction"));
+    setStage(BeginStaging, QStringLiteral("Writing candidate to W25Q128"));
     sendRequest(App1Codec::BlBegin, payload);
 }
 
@@ -413,13 +421,14 @@ void FirmwareUpgradeController::sendNextData()
         return;
     }
     const quint32 count = qMin<quint32>(
-        m_blockSize, quint32(m_image.image.size()) - m_offset);
+        qMin<quint32>(m_blockSize, quint32(m_image.image.size()) - m_offset),
+        4096U - (m_offset & 4095U));
     QByteArray payload;
     append32(payload, m_offset);
     append16(payload, quint16(count));
     payload.append(m_image.image.mid(int(m_offset), int(count)));
     m_sentEnd = m_offset + count;
-    setStage(Transfer, QStringLiteral("Transferring firmware"));
+    setStage(TransferToExternal, QStringLiteral("Writing candidate to W25Q128"));
     sendRequest(App1Codec::BlData, payload);
 }
 
@@ -428,8 +437,14 @@ void FirmwareUpgradeController::sendEnd()
     QByteArray payload;
     append32(payload, quint32(m_image.image.size()));
     append32(payload, m_image.crc32);
-    setStage(End, QStringLiteral("Verifying firmware"));
+    setStage(EndStaging, QStringLiteral("Verifying staged W25Q128 image"));
     sendRequest(App1Codec::BlEnd, payload);
+}
+
+void FirmwareUpgradeController::sendInstall()
+{
+    setStage(Install, QStringLiteral("Starting STM32 internal Flash installation"));
+    sendRequest(App1Codec::BlInstall);
 }
 
 void FirmwareUpgradeController::onDataReceived(const QByteArray &data)
@@ -544,7 +559,7 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         break;
     case App1Codec::BlHello:
         if (response.payload.size() < 20
-            || read16(response.payload, 0) != 1U
+            || read16(response.payload, 0) != 2U
             || read32(response.payload, 4) != IntelHexParser::ApplicationBase
             || read32(response.payload, 8) < quint32(m_image.image.size())) {
             fail(QStringLiteral("Bootloader capabilities are incompatible."));
@@ -558,18 +573,37 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         sendStatus();
         break;
     case App1Codec::BlStatus: {
-        if (response.payload.size() != 14) {
-            fail(QStringLiteral("Bootloader status response is malformed."));
+        if (response.payload.size() != 48 || read16(response.payload, 0) != 2U) {
+            fail(QStringLiteral("Bootloader V2 status response is malformed."));
             return;
         }
-        const quint32 size = read32(response.payload, 0);
-        const quint32 crc = read32(response.payload, 4);
-        const quint16 state = read16(response.payload, 12);
-        if (state == 1U
-            && (size != quint32(m_image.image.size()) || crc != m_image.crc32)) {
-            setStage(Begin,
-                     QStringLiteral("Discarding a different interrupted image"));
+        const quint8 phase = quint8(response.payload.at(2));
+        const quint32 size = read32(response.payload, 8);
+        const quint32 crc = read32(response.payload, 12);
+        const QByteArray packageId = response.payload.mid(32, 16);
+        emit recoveryStatusChanged(phase, quint8(response.payload.at(4)),
+                                   quint8(response.payload.at(5)), packageId,
+                                   read32(response.payload, 16), read32(response.payload, 20),
+                                   read32(response.payload, 24), read16(response.payload, 28));
+        if (phase == 2U && (size != quint32(m_image.image.size())
+                            || crc != m_image.crc32 || packageId != m_packageId)) {
+            setStage(BeginStaging,
+                     QStringLiteral("Discarding a different staged image"));
             sendRequest(App1Codec::BlAbort);
+        } else if (phase >= 6U && phase <= 8U) {
+            setStage(MonitorRecovery,
+                     QStringLiteral("Installing firmware into STM32 internal Flash"));
+            if (!m_recoveryTimer.isActive())
+                m_recoveryTimer.start();
+        } else if (phase == 1U && m_stage == MonitorRecovery) {
+            m_recoveryTimer.stop();
+            m_transport->close();
+            setStage(WaitApplication, QStringLiteral("Waiting for upgraded application"));
+            m_transitionElapsed.restart();
+            m_transitionTimer.start();
+            QTimer::singleShot(0, this, &FirmwareUpgradeController::scanForTransition);
+        } else if (phase == 9U) {
+            fail(QStringLiteral("Bootloader recovery reported an error."));
         } else {
             sendBegin();
         }
@@ -612,13 +646,12 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         break;
     }
     case App1Codec::BlEnd:
-        m_transport->close();
-        setStage(WaitApplication,
-                 QStringLiteral("Waiting for upgraded application"));
-        m_transitionElapsed.restart();
-        m_transitionTimer.start();
-        QTimer::singleShot(0, this,
-                           &FirmwareUpgradeController::scanForTransition);
+        sendInstall();
+        break;
+    case App1Codec::BlInstall:
+        setStage(MonitorRecovery,
+                 QStringLiteral("Installing firmware into STM32 internal Flash"));
+        m_recoveryTimer.start();
         break;
     default:
         fail(QStringLiteral("Unexpected Bootloader response."));
@@ -634,6 +667,12 @@ void FirmwareUpgradeController::updateProgress(quint32 acknowledged)
     const quint32 remaining = quint32(m_image.image.size()) - acknowledged;
     const int eta = speed > 0.0 ? int(double(remaining) / speed + 0.5) : 0;
     emit progressChanged(acknowledged, quint32(m_image.image.size()), speed, eta);
+}
+
+void FirmwareUpgradeController::pollRecovery()
+{
+    if (m_stage == MonitorRecovery)
+        sendStatus();
 }
 
 void FirmwareUpgradeController::onTransportError(const QString &message)
@@ -655,7 +694,7 @@ void FirmwareUpgradeController::onDisconnected()
     if (m_stage == EnterBootloader) {
         setStage(WaitBootloader,
                  QStringLiteral("Waiting for Bootloader USB device"));
-    } else if (m_stage == End) {
+    } else if (m_stage == EndStaging) {
         setStage(WaitApplication,
                  QStringLiteral("Waiting for upgraded application"));
     } else if (m_stage == WaitBootloader || m_stage == WaitApplication) {

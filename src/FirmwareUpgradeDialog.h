@@ -39,6 +39,10 @@ private slots:
                                  bool downgrade);
     void upgradeFinished(bool success, const QString &message);
     void appendLog(const QString &message);
+    void updateRecoveryStatus(quint8 phase, quint8 activeSlot,
+                              quint8 candidateSlot, const QByteArray &packageId,
+                              quint32 downloadOffset, quint32 backupOffset,
+                              quint32 installOffset, quint16 lastError);
 
 private:
     void setUpgradeActive(bool active);
@@ -61,6 +65,7 @@ private:
     QLabel *m_compatibilityLabel = nullptr;
     QCheckBox *m_allowDowngradeCheck = nullptr;
     QLabel *m_phaseLabel = nullptr;
+    QLabel *m_recoveryLabel = nullptr;
     QProgressBar *m_progressBar = nullptr;
     QLabel *m_bytesLabel = nullptr;
     QLabel *m_speedLabel = nullptr;

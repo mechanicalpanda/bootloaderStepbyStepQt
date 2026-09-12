@@ -34,6 +34,12 @@ int main(int argc, char *argv[])
     WinUsbTransport transport;
     FirmwareUpgradeController controller(&transport);
     bool started = false;
+    QObject::connect(&controller, &FirmwareUpgradeController::stageChanged,
+                     [&output](FirmwareUpgradeController::Stage stage,
+                               const QString &description) {
+        output << "STAGE " << int(stage) << ": " << description << "\n";
+        output.flush();
+    });
     QObject::connect(&controller, &FirmwareUpgradeController::logMessage,
                      [&output](const QString &message) {
         output << "LOG: " << message << "\n";

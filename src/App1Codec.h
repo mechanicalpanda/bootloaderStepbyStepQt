@@ -28,7 +28,9 @@ public:
         BlEnd = 0x0203,
         BlStatus = 0x0204,
         BlAbort = 0x0205,
-        BlReboot = 0x0206
+        BlReboot = 0x0206,
+        BlInstall = 0x0207,
+        BlClearError = 0x0208
     };
 
     enum Mode : quint8
