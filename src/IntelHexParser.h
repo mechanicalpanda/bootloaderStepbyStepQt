@@ -13,6 +13,9 @@ struct FirmwareImage
     quint32 crc32 = 0;
     quint32 baseAddress = 0x08020000U;
     FirmwareInfo firmwareInfo;
+    bool encrypted = false;
+    QByteArray aesIv;
+    QByteArray packageId;
 };
 
 class IntelHexParser

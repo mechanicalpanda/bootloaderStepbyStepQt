@@ -49,7 +49,7 @@ FirmwareUpgradeDialog::FirmwareUpgradeDialog(QWidget *parent)
     m_filePathEdit = new QLineEdit(fileGroup);
     m_filePathEdit->setObjectName(QStringLiteral("firmwarePath"));
     m_filePathEdit->setReadOnly(true);
-    m_filePathEdit->setPlaceholderText(QStringLiteral("请选择新布局 .hex 或 .ihx 文件"));
+    m_filePathEdit->setPlaceholderText(QStringLiteral("请选择 .myaes 加密固件或 HEX 文件"));
     m_browseButton = new QPushButton(QStringLiteral("浏览..."), fileGroup);
     m_browseButton->setObjectName(QStringLiteral("browseButton"));
     m_fileSummaryLabel = new QLabel(QStringLiteral("尚未加载固件"), fileGroup);
@@ -209,7 +209,7 @@ void FirmwareUpgradeDialog::browseFirmware()
 {
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("选择升级固件"), QString(),
-        QStringLiteral("Intel HEX 固件 (*.hex *.ihx);;所有文件 (*.*)"));
+        QStringLiteral("加密固件 (*.myaes);;Intel HEX 固件 (*.hex *.ihx);;所有文件 (*.*)"));
     if (path.isEmpty())
         return;
     FirmwareImage image;

@@ -146,7 +146,9 @@ void FirmwareUpgradeController::startUpgrade(const UpgradeDevice &device,
         return;
     if (image.image.size() <= FirmwareInfo::HeaderSize
         || image.image.size() > int(IntelHexParser::ApplicationSize)
-        || image.firmwareInfo.raw.size() != FirmwareInfo::HeaderSize) {
+        || image.firmwareInfo.raw.size() != FirmwareInfo::HeaderSize
+        || (image.encrypted
+            && (image.aesIv.size() != 16 || image.packageId.size() != 16))) {
         fail(QStringLiteral("Firmware image or information header is invalid."));
         return;
     }
@@ -155,7 +157,8 @@ void FirmwareUpgradeController::startUpgrade(const UpgradeDevice &device,
     m_image = image;
     m_rxStream.clear();
     m_pendingFrame.clear();
-    m_packageId = QUuid::createUuid().toRfc4122();
+    m_packageId = image.encrypted ? image.packageId
+                                  : QUuid::createUuid().toRfc4122();
     m_sequence = 0U;
     m_offset = 0U;
     m_sentEnd = 0U;
@@ -401,13 +404,15 @@ void FirmwareUpgradeController::sendStatus()
 void FirmwareUpgradeController::sendBegin()
 {
     QByteArray payload;
-    append16(payload, 3U);
+    append16(payload, m_image.encrypted ? 4U : 3U);
     append16(payload, FirmwareInfo::HeaderSize);
     append32(payload, m_image.baseAddress);
     append32(payload, quint32(m_image.image.size()));
     append32(payload, m_image.crc32);
     payload.append(m_packageId);
     payload.append(m_image.firmwareInfo.raw);
+    if (m_image.encrypted)
+        payload.append(m_image.aesIv);
     setStage(BeginStaging, QStringLiteral("Writing candidate to W25Q128"));
     sendRequest(App1Codec::BlBegin, payload);
 }
@@ -562,10 +567,15 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
         break;
     case App1Codec::BlHello:
         if (response.payload.size() < 20
-            || read16(response.payload, 0) != 2U
+            || (read16(response.payload, 0) != 2U
+                && read16(response.payload, 0) != 3U)
             || read32(response.payload, 4) != IntelHexParser::ApplicationBase
             || read32(response.payload, 8) < quint32(m_image.image.size())) {
             fail(QStringLiteral("Bootloader capabilities are incompatible."));
+            return;
+        }
+        if (m_image.encrypted && read16(response.payload, 0) < 3U) {
+            fail(QStringLiteral("Bootloader does not support encrypted firmware."));
             return;
         }
         m_blockSize = qMin<quint16>(240U, read16(response.payload, 12));

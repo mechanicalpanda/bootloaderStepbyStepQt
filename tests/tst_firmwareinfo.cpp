@@ -6,6 +6,7 @@
 #include "IntelHexParser.h"
 
 #include <QtEndian>
+#include <QTemporaryFile>
 
 class FirmwareInfoTest : public QObject
 {
@@ -97,6 +98,43 @@ private:
     }
 
 private slots:
+    void parsesEncryptedPackageFile()
+    {
+        QByteArray encrypted(312 + 0x420, char(0x5A));
+        encrypted.replace(0, 4, QByteArrayLiteral("MFE1"));
+        write16(encrypted, 4, 1U);
+        write16(encrypted, 6, 312U);
+        write32(encrypted, 8, IntelHexParser::ApplicationBase);
+        write32(encrypted, 12, 0x420U);
+        write32(encrypted, 16, 0x12345678U);
+        encrypted.replace(20, 12, QByteArray(12, char(0xA5)));
+        encrypted.replace(32, 4, QByteArray(4, char(0)));
+        encrypted.replace(36, 16, QByteArray(16, char(0x3C)));
+        write32(encrypted, 52, App1Codec::crc32(encrypted.mid(312)));
+        encrypted.replace(56, FirmwareInfo::HeaderSize, validHeader());
+        QTemporaryFile file;
+        QVERIFY(file.open());
+        QCOMPARE(file.write(encrypted), qint64(encrypted.size()));
+        const QString path = file.fileName();
+        file.close();
+        FirmwareImage image;
+        QString error;
+        QVERIFY2(IntelHexParser::parseFile(path, &image, &error),
+                 qPrintable(error));
+        QVERIFY(image.encrypted);
+        QCOMPARE(image.image, encrypted.mid(312));
+        QCOMPARE(image.crc32, quint32(0x12345678U));
+        QCOMPARE(image.aesIv, encrypted.mid(20, 16));
+        QCOMPARE(image.packageId, encrypted.mid(36, 16));
+        encrypted[312] = char(encrypted.at(312) ^ 1);
+        QVERIFY(file.open());
+        file.resize(0);
+        QCOMPARE(file.write(encrypted), qint64(encrypted.size()));
+        file.close();
+        QVERIFY(!IntelHexParser::parseFile(path, &image, &error));
+        QVERIFY(error.contains(QStringLiteral("CRC32")));
+    }
+
     void decodesGoldenFirmwareHeader()
     {
         FirmwareInfo info;

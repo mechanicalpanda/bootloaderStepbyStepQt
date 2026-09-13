@@ -32,6 +32,48 @@ quint32 readVectorWord(const QByteArray &data, int offset)
     return qFromLittleEndian<quint32>(
         reinterpret_cast<const uchar *>(data.constData() + offset));
 }
+
+bool parseEncryptedPackage(const QByteArray &data, FirmwareImage *image,
+                           QString *error)
+{
+    constexpr int headerSize = 312;
+    if (!image || data.size() < headerSize)
+        return fail(error, 0, QStringLiteral("encrypted package is truncated"));
+    const auto *bytes = reinterpret_cast<const uchar *>(data.constData());
+    const quint16 version = qFromLittleEndian<quint16>(bytes + 4);
+    const quint16 declaredHeader = qFromLittleEndian<quint16>(bytes + 6);
+    const quint32 base = qFromLittleEndian<quint32>(bytes + 8);
+    const quint32 size = qFromLittleEndian<quint32>(bytes + 12);
+    const quint32 plainCrc = qFromLittleEndian<quint32>(bytes + 16);
+    const quint32 cipherCrc = qFromLittleEndian<quint32>(bytes + 52);
+    if (version != 1U || declaredHeader != headerSize
+        || base != IntelHexParser::ApplicationBase
+        || size < 264U || size > IntelHexParser::ApplicationSize
+        || quint64(data.size()) != quint64(headerSize) + size
+        || data.mid(32, 4) != QByteArray(4, char(0))) {
+        return fail(error, 0, QStringLiteral("encrypted package header is invalid"));
+    }
+    const QByteArray ciphertext = data.mid(headerSize);
+    if (App1Codec::crc32(ciphertext) != cipherCrc)
+        return fail(error, 0, QStringLiteral("encrypted package CRC32 mismatch"));
+    FirmwareInfo info;
+    QString infoError;
+    if (!FirmwareInfo::decode(data.mid(56, FirmwareInfo::HeaderSize),
+                              &info, &infoError))
+        return fail(error, 0, QStringLiteral("firmware information: %1").arg(infoError));
+    if (info.imageBase != base || info.vectorBase != IntelHexParser::VectorBase
+        || size > info.applicationRegionSize)
+        return fail(error, 0, QStringLiteral("encrypted package metadata mismatch"));
+    *image = FirmwareImage{};
+    image->image = ciphertext;
+    image->crc32 = plainCrc;
+    image->baseAddress = base;
+    image->firmwareInfo = info;
+    image->encrypted = true;
+    image->aesIv = data.mid(20, 16);
+    image->packageId = data.mid(36, 16);
+    return true;
+}
 }
 
 bool IntelHexParser::parseFile(const QString &path, FirmwareImage *image,
@@ -41,7 +83,10 @@ bool IntelHexParser::parseFile(const QString &path, FirmwareImage *image,
     if (!file.open(QIODevice::ReadOnly))
         return fail(error, 0, QStringLiteral("cannot open HEX file: %1")
                     .arg(file.errorString()));
-    return parse(file.readAll(), image, error);
+    const QByteArray data = file.readAll();
+    if (data.startsWith("MFE1"))
+        return parseEncryptedPackage(data, image, error);
+    return parse(data, image, error);
 }
 
 bool IntelHexParser::parse(const QByteArray &hexText, FirmwareImage *image,
@@ -49,6 +94,7 @@ bool IntelHexParser::parse(const QByteArray &hexText, FirmwareImage *image,
 {
     if (!image)
         return fail(error, 0, QStringLiteral("output image is null"));
+    *image = FirmwareImage{};
     QMap<quint32, quint8> bytes;
     quint32 addressBase = 0U;
     bool eofSeen = false;
