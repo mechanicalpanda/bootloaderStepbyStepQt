@@ -16,6 +16,7 @@ public:
     bool open(const UpgradeDevice &device, QString *error) override;
     void close() override;
     bool write(const QByteArray &data, QString *error) override;
+    static bool isDisconnectError(unsigned long code);
 
 private slots:
     void pollInput();

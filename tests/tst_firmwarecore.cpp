@@ -8,6 +8,7 @@
 #include "IntelHexParser.h"
 #include "UpgradeTransport.h"
 #include "WinUsbDeviceDiscovery.h"
+#include "WinUsbTransport.h"
 
 #include <QtEndian>
 
@@ -234,6 +235,12 @@ private:
     }
 
 private slots:
+    void classifiesWindowsNoSuchDeviceAsDisconnect()
+    {
+        QVERIFY(WinUsbTransport::isDisconnectError(433UL));
+        QVERIFY(!WinUsbTransport::isDisconnectError(5UL));
+    }
+
     void exposesFirmwareAndCompatibilityControls()
     {
         FirmwareUpgradeDialog dialog;
@@ -528,6 +535,100 @@ private slots:
         answerInformationSequence(transport, App1Codec::ApplicationMode,
                                   candidate.firmwareInfo.raw);
         QTRY_COMPARE(controller.stage(), FirmwareUpgradeController::Completed);
+    }
+
+    void waitsForRecoveryStatusReplyBeforePollingAgain()
+    {
+        FakeTransport transport;
+        const UpgradeDevice boot = upgradeDevice(UpgradeDevice::BootloaderMode);
+        transport.devices = {boot};
+        FirmwareUpgradeController controller(&transport);
+        controller.startUpgrade(boot, image(info(2U, 1U, 0U)));
+        answerInformationSequence(transport, App1Codec::BootloaderMode,
+                                  header(1U, 0U, 0U));
+
+        QByteArray hello;
+        append16(hello, 2U);
+        append16(hello, 0U);
+        append32(hello, IntelHexParser::ApplicationBase);
+        append32(hello, IntelHexParser::ApplicationSize);
+        append16(hello, 240U);
+        append16(hello, 0U);
+        append32(hello, 0U);
+        respond(transport, App1Codec::BlHello, hello);
+        respond(transport, App1Codec::BlStatus, statusPayload());
+
+        QByteArray offset;
+        append32(offset, 256U);
+        respond(transport, App1Codec::BlBegin, offset);
+        offset.clear();
+        append32(offset, 496U);
+        respond(transport, App1Codec::BlData, offset);
+        offset.clear();
+        append32(offset, 600U);
+        respond(transport, App1Codec::BlData, offset);
+        respond(transport, App1Codec::BlEnd, {});
+        respond(transport, App1Codec::BlInstall, {});
+
+        QTRY_COMPARE(lastRequest(transport).type, quint16(App1Codec::BlStatus));
+        const int requestCount = transport.writes.size();
+        QTest::qWait(600);
+        QCOMPARE(transport.writes.size(), requestCount);
+        QCOMPARE(controller.stage(), FirmwareUpgradeController::MonitorRecovery);
+    }
+
+    void keepsRecoveryPhasesOutOfStaging_data()
+    {
+        QTest::addColumn<quint8>("phase");
+        QTest::addColumn<bool>("afterInstall");
+        QTest::newRow("staged-after-install") << quint8(3U) << true;
+        QTest::newRow("backing-up-after-install") << quint8(4U) << true;
+        QTest::newRow("backup-ready-after-install") << quint8(5U) << true;
+        QTest::newRow("backing-up-after-reconnect") << quint8(4U) << false;
+        QTest::newRow("backup-ready-after-reconnect") << quint8(5U) << false;
+    }
+
+    void keepsRecoveryPhasesOutOfStaging()
+    {
+        QFETCH(quint8, phase);
+        QFETCH(bool, afterInstall);
+        FakeTransport transport;
+        const UpgradeDevice boot = upgradeDevice(UpgradeDevice::BootloaderMode);
+        transport.devices = {boot};
+        FirmwareUpgradeController controller(&transport);
+        controller.startUpgrade(boot, image(info(2U, 1U, 0U)));
+        answerInformationSequence(transport, App1Codec::BootloaderMode,
+                                  header(1U, 0U, 0U));
+
+        QByteArray hello;
+        append16(hello, 2U);
+        append16(hello, 0U);
+        append32(hello, IntelHexParser::ApplicationBase);
+        append32(hello, IntelHexParser::ApplicationSize);
+        append16(hello, 240U);
+        append16(hello, 0U);
+        append32(hello, 0U);
+        respond(transport, App1Codec::BlHello, hello);
+        if (afterInstall) {
+            respond(transport, App1Codec::BlStatus, statusPayload());
+            QByteArray offset;
+            append32(offset, 256U);
+            respond(transport, App1Codec::BlBegin, offset);
+            offset.clear();
+            append32(offset, 496U);
+            respond(transport, App1Codec::BlData, offset);
+            offset.clear();
+            append32(offset, 600U);
+            respond(transport, App1Codec::BlData, offset);
+            respond(transport, App1Codec::BlEnd, {});
+            respond(transport, App1Codec::BlInstall, {});
+            QTRY_COMPARE(lastRequest(transport).type, quint16(App1Codec::BlStatus));
+        }
+
+        const int requestCount = transport.writes.size();
+        respond(transport, App1Codec::BlStatus, statusPayload(phase));
+        QCOMPARE(controller.stage(), FirmwareUpgradeController::MonitorRecovery);
+        QCOMPARE(transport.writes.size(), requestCount);
     }
 };
 

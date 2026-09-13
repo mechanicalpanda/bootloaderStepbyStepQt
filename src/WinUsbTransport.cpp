@@ -19,6 +19,13 @@ WinUsbTransport::~WinUsbTransport()
     close();
 }
 
+bool WinUsbTransport::isDisconnectError(unsigned long code)
+{
+    // WinUSB may report ERROR_NO_SUCH_DEVICE (433) when USB re-enumerates.
+    return code == ERROR_DEVICE_NOT_CONNECTED || code == ERROR_GEN_FAILURE
+        || code == ERROR_INVALID_HANDLE || code == 433UL;
+}
+
 QList<UpgradeDevice> WinUsbTransport::discover(QString *error)
 {
     return WinUsbDeviceDiscovery::enumerate(error);
@@ -177,8 +184,7 @@ void WinUsbTransport::pollInput()
         || code == ERROR_NO_MORE_ITEMS)
         return;
     close();
-    if (code == ERROR_DEVICE_NOT_CONNECTED
-        || code == ERROR_GEN_FAILURE || code == ERROR_INVALID_HANDLE)
+    if (isDisconnectError(code))
         emit disconnected();
     else
         emit transportError(errorText(QStringLiteral("WinUSB Bulk IN"), code));

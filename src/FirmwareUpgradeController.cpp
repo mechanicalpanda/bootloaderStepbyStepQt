@@ -593,7 +593,8 @@ void FirmwareUpgradeController::handleResponse(const App1Frame &response)
             setStage(BeginStaging,
                      QStringLiteral("Discarding a different staged image"));
             sendRequest(App1Codec::BlAbort);
-        } else if (phase >= 6U && phase <= 8U) {
+        } else if ((phase >= 4U && phase <= 8U)
+                   || (phase == 3U && m_stage == MonitorRecovery)) {
             setStage(MonitorRecovery,
                      QStringLiteral("Installing firmware into STM32 internal Flash"));
             if (!m_recoveryTimer.isActive())
@@ -674,7 +675,7 @@ void FirmwareUpgradeController::updateProgress(quint32 acknowledged)
 
 void FirmwareUpgradeController::pollRecovery()
 {
-    if (m_stage == MonitorRecovery)
+    if (m_stage == MonitorRecovery && !m_requestTimer.isActive())
         sendStatus();
 }
 
